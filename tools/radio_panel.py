@@ -13,14 +13,19 @@ meters. TV Tuna panel skeleton in a vintage cabinet.
 """
 import json
 import os
+import queue
 import re
 import subprocess
+import sys
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 import numpy as np
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from audio_probe import read_wav_tail, judge   # the audio liveness dial
 
 HERE = Path(__file__).resolve().parent
 LAB = HERE.parent / "lab"
@@ -35,11 +40,35 @@ FS_CAP = 2 * FS_NRSC5
 
 STATE = {"mhz": None, "prog": None, "name": None, "listening": False,
          "title": None, "artist": None, "mer_lo": None, "mer_hi": None,
-         "ber": None, "sync": False, "stage": "", "pct": 0}
+         "ber": None, "sync": False, "stage": "", "pct": 0,
+         "audio": None}
 
 
 def set_stage(pct, msg):
     STATE.update({"pct": pct, "stage": msg})
+
+
+def audio_watch(my_gen, wav, on_static=None):
+    """The apparatus, embedded: every 10 s judge the WAV tail. Two
+    consecutive STATIC verdicts = the sound is a lie; call on_static."""
+    bad = 0
+    while GEN[0] == my_gen:
+        time.sleep(10)
+        if GEN[0] != my_gen:
+            return
+        try:
+            x, rate = read_wav_tail(wav, 3.0)
+            v = judge(x, rate)
+            STATE["audio"] = v.get("verdict")
+        except Exception:
+            continue
+        if v.get("verdict") == "STATIC":
+            bad += 1
+            if bad >= 2 and on_static and GEN[0] == my_gen:
+                on_static()
+                return
+        else:
+            bad = 0
 SURVEY = {"running": False, "line": "", "pct": 0}
 GEN = [0]
 LOCK = threading.Lock()
@@ -258,7 +287,7 @@ def run_survey():
 
 
 # ── listening ──────────────────────────────────────────────────────
-def listen(mhz, prog, name):
+def listen(mhz, prog, name, ifgr=59, rfgain="3"):
     stop_listen()
     time.sleep(1)
     with LOCK:
@@ -274,7 +303,7 @@ def listen(mhz, prog, name):
         sdr = st = None
         for attempt in range(4):          # post-restart contention retry
             try:
-                sdr, st = open_sdr(mhz, ifgr=59, rfgain="3")
+                sdr, st = open_sdr(mhz, ifgr=ifgr, rfgain=str(rfgain))
                 break
             except Exception:
                 if GEN[0] != my_gen:
@@ -318,14 +347,41 @@ def listen(mhz, prog, name):
         set_stage(45, "decoder hunting sync")
         nr_t0 = time.time()
         mpv = None
+        # LOSSLESS PUMP (2026-07-05): the SDR loop must NEVER block on the
+        # decoder's pipe — backpressure was stalling reads, dropping
+        # samples, and turning clean BER into static audio. Reader only
+        # reads; a writer thread absorbs pipe stalls via a deep queue.
+        q = queue.Queue(maxsize=256)
+
+        def feeder():
+            while GEN[0] == my_gen:
+                try:
+                    chunk = q.get(timeout=1)
+                except queue.Empty:
+                    continue
+                try:
+                    nr.stdin.write(
+                        cs16_to_cu8(decimate2(chunk)).tobytes())
+                except (OSError, ValueError):
+                    return
+        threading.Thread(target=feeder, daemon=True).start()
+
+        def on_static():
+            set_stage(30, "audio probe says STATIC — HD stream is lying; "
+                          "switching to analog FM…")
+            threading.Thread(target=listen_fm, args=(mhz, name),
+                             daemon=True).start()
+        threading.Thread(target=audio_watch,
+                         args=(my_gen, wav, on_static),
+                         daemon=True).start()
         while GEN[0] == my_gen:
             r = sdr.readStream(st, [buf], 65536, timeoutUs=500000)
             if r.ret > 0:
+                n = r.ret - (r.ret & 1)      # keep I/Q pairing even
                 try:
-                    nr.stdin.write(
-                        cs16_to_cu8(decimate2(buf[:2 * r.ret])).tobytes())
-                except (OSError, ValueError):
-                    break
+                    q.put_nowait(buf[:2 * n].copy())
+                except queue.Full:
+                    pass                     # decoder hopeless behind; skip
             if STATE.get("sync") and STATE["pct"] < 70:
                 set_stage(70, "SYNC — decoding digital audio")
             # honesty + rescue: no sync in 25 s = this station's HD is out
@@ -358,7 +414,7 @@ def listen(mhz, prog, name):
     threading.Thread(target=worker, daemon=True).start()
 
 
-def listen_fm(mhz, name):
+def listen_fm(mhz, name, ifgr=59, rfgain="3"):
     """Analog FM v1: pure-numpy WFM demod (mono + 75us de-emphasis) at
     the pump, growing WAV, mpv tails it. Stereo + pilot-SNR telemetry
     arrive with the gr-based path (campaign upgrade)."""
@@ -378,7 +434,7 @@ def listen_fm(mhz, name):
         sdr = st = None
         for attempt in range(4):
             try:
-                sdr, st = open_sdr(mhz, ifgr=59, rfgain="3")
+                sdr, st = open_sdr(mhz, ifgr=ifgr, rfgain=str(rfgain))
                 break
             except Exception:
                 if GEN[0] != my_gen:
@@ -407,6 +463,7 @@ def listen_fm(mhz, name):
         buf = np.empty(2 * 65536, np.int16)
         prev = np.complex64(1 + 0j)
         de = 0.0
+        agc = 60000.0                             # adaptive output gain
         alpha = 1.0 / (1.0 + 75e-6 * AUDIO_FS)   # 75us de-emphasis pole
         mpv = None
         t0 = time.time()
@@ -434,7 +491,11 @@ def listen_fm(mhz, name):
                 acc += alpha * (a[i] - acc)
                 out[i] = acc
             de = float(acc)
-            pcm = np.clip(out * 12000.0, -32000, 32000).astype(np.int16)
+            # slow AGC: ride any station to ~17% FS rms, never clip peaks
+            r_ = float(np.sqrt((out ** 2).mean())) + 1e-9
+            want = min(max(5500.0 / r_, 12000.0), 400000.0)
+            agc += 0.06 * (want - agc)
+            pcm = np.clip(out * agc, -32000, 32000).astype(np.int16)
             fh.write(pcm.tobytes())
             fh.flush()
             if mpv is None and time.time() - t0 > 2.5:
@@ -511,6 +572,7 @@ transition:width .8s;border-radius:5px}
  <div class="meter"><div class="k">MER HI</div><div class="v" id="mhi">—</div></div>
  <div class="meter"><div class="k">BER</div><div class="v" id="ber">—</div></div>
  <div class="meter"><div class="k">LOCK</div><div class="v" id="lock">—</div></div>
+ <div class="meter"><div class="k">AUDIO</div><div class="v" id="audio">—</div></div>
 </div>
 <div style="text-align:center">
  <button class="knob" onclick="survey()">📡 SURVEY THE BAND</button>
@@ -560,6 +622,11 @@ document.getElementById('mhi').textContent=s.mer_hi??'—';
 document.getElementById('ber').textContent=s.ber!=null?s.ber.toFixed(4):'—';
 document.getElementById('lock').textContent=s.sync?'●':'—';
 document.getElementById('lock').style.color=s.sync?'#7dff8a':'#a8895c';
+const au=document.getElementById('audio');
+au.textContent=s.audio==='MUSIC/SPEECH'?'♪':(s.audio==='STATIC'?'✗':
+(s.audio==='SILENCE'?'…':(s.audio||'—')));
+au.style.color=s.audio==='MUSIC/SPEECH'?'#7dff8a':
+(s.audio==='STATIC'?'#ff6b4d':'#a8895c');
 if(s.survey&&s.survey.running)document.getElementById('status').textContent=
 '📡 '+s.survey.line+' ('+s.survey.pct+'%)';
 const pb=document.getElementById('pbar');
@@ -624,13 +691,17 @@ class H(BaseHTTPRequestHandler):
             self._send('"surveying"')
         elif self.path == "/api/listen_fm":
             threading.Thread(target=listen_fm,
-                             args=(req["mhz"], req.get("name", "")),
+                             args=(req["mhz"], req.get("name", ""),
+                                   req.get("ifgr", 59),
+                                   req.get("rfgain", "3")),
                              daemon=True).start()
             self._send('"listening analog"')
         elif self.path == "/api/listen":
             threading.Thread(target=listen,
                              args=(req["mhz"], req["prog"],
-                                   req.get("name", "")),
+                                   req.get("name", ""),
+                                   req.get("ifgr", 59),
+                                   req.get("rfgain", "3")),
                              daemon=True).start()
             self._send('"listening"')
         elif self.path == "/api/stop":
