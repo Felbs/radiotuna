@@ -27,14 +27,15 @@ from pathlib import Path
 import numpy as np
 
 HERE = Path(__file__).resolve().parent
-LAB = HERE / "lab"
+LAB = HERE.parent / "lab"          # project-root lab/, not tools/lab
+LAB.mkdir(exist_ok=True)
 NRSC5 = r"C:\Tools\nrsc5\nrsc5.exe"
 MPV = r"C:\Program Files\MPV Player\mpv.exe"
 FS_NRSC5 = 1_488_375.0
 FS_CAP = 2 * FS_NRSC5          # capture at 2x, decimate by 2
 
 
-def open_sdr(mhz):
+def open_sdr(mhz, ifgr=40.0, rfgain="3"):
     import SoapySDR
     from SoapySDR import SOAPY_SDR_RX, SOAPY_SDR_CS16
     SoapySDR.SoapySDR_setLogLevel(SoapySDR.SOAPY_SDR_FATAL)
@@ -46,14 +47,20 @@ def open_sdr(mhz):
         sdr.setGainMode(SOAPY_SDR_RX, 0, False)
     except Exception:
         pass
-    sdr.setGain(SOAPY_SDR_RX, 0, "IFGR", 40.0)
+    sdr.setGain(SOAPY_SDR_RX, 0, "IFGR", ifgr)
     try:
-        sdr.writeSetting("rfgain_sel", "3")
+        sdr.writeSetting("rfgain_sel", str(rfgain))
     except Exception:
         pass
     st = sdr.setupStream(SOAPY_SDR_RX, SOAPY_SDR_CS16)
     sdr.activateStream(st)
     return sdr, st, SOAPY_SDR_RX
+
+
+def cs16_to_cu8(raw_i16):
+    """This nrsc5 build's cs16 file path is silent/broken; its cu8 path
+    (the RTL-native dialect everyone uses) works — convert on write."""
+    return ((raw_i16.astype(np.int32) >> 8) + 128).clip(0, 255).astype(np.uint8)
 
 
 def decimate2_cs16(raw):
@@ -71,19 +78,19 @@ def decimate2_cs16(raw):
 
 
 def cmd_capture(args):
-    sdr, st, RX = open_sdr(args.mhz)
+    sdr, st, RX = open_sdr(args.mhz, args.ifgr, args.rfgain)
     import SoapySDR
     n_want = int(args.secs * FS_CAP)
     buf = np.empty(2 * 65536, np.int16)
     stamp = time.strftime("%H%M%S")
-    out = LAB / f"hd_{str(args.mhz).replace('.', '')}_{stamp}.cs16"
+    out = LAB / f"hd_{str(args.mhz).replace('.', '')}_{stamp}.cu8"
     got = 0
     with open(out, "wb") as f:
         while got < n_want:
             r = sdr.readStream(st, [buf], 65536, timeoutUs=500000)
             if r.ret > 0:
                 n = min(r.ret, n_want - got)
-                f.write(decimate2_cs16(buf[:2 * n]).tobytes())
+                f.write(cs16_to_cu8(decimate2_cs16(buf[:2 * n])).tobytes())
                 got += n
     sdr.deactivateStream(st)
     sdr.closeStream(st)
@@ -92,8 +99,7 @@ def cmd_capture(args):
 
 
 def run_nrsc5(iq_path, mhz, prog, wav_path, live_stats=True):
-    cmd = [NRSC5, "-r", str(iq_path), "--iq-input-format", "cs16",
-           "-o", str(wav_path), str(mhz), str(prog)]
+    cmd = [NRSC5, "-r", str(iq_path), "-o", str(wav_path), str(prog)]
     p = subprocess.Popen(cmd, stdout=subprocess.PIPE,
                          stderr=subprocess.STDOUT, text=True,
                          errors="replace")
@@ -149,7 +155,7 @@ def cmd_live(args):
     reads it as a file that keeps growing; audio WAV also grows and mpv
     tails it. Latency ~2-4 s. Ctrl+C stops."""
     sdr, st, RX = open_sdr(args.mhz)
-    iq_path = LAB / "hd_live.cs16"
+    iq_path = LAB / "hd_live.cu8"
     wav = LAB / "hd_live.wav"
     for f in (iq_path, wav):
         try:
@@ -164,7 +170,7 @@ def cmd_live(args):
             while not stop.is_set():
                 r = sdr.readStream(st, [buf], 65536, timeoutUs=500000)
                 if r.ret > 0:
-                    f.write(decimate2_cs16(buf[:2 * r.ret]).tobytes())
+                    f.write(cs16_to_cu8(decimate2_cs16(buf[:2 * r.ret])).tobytes())
                     f.flush()
 
     threading.Thread(target=pump, daemon=True).start()
@@ -172,8 +178,7 @@ def cmd_live(args):
     print("starting nrsc5 (stats below) — mpv follows the audio…",
           flush=True)
     nr = subprocess.Popen(
-        [NRSC5, "-r", str(iq_path), "--iq-input-format", "cs16",
-         "-o", str(wav), str(args.mhz), str(args.prog)],
+        [NRSC5, "-r", str(iq_path), "-o", str(wav), str(args.prog)],
         stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
         errors="replace")
     mpv_started = False
@@ -200,6 +205,8 @@ def main():
     c = sub.add_parser("capture")
     c.add_argument("--mhz", type=float, required=True)
     c.add_argument("--secs", type=float, default=15)
+    c.add_argument("--ifgr", type=float, default=40.0)
+    c.add_argument("--rfgain", default="3")
     d = sub.add_parser("decode")
     d.add_argument("--iq", required=True)
     d.add_argument("--mhz", type=float, required=True)
