@@ -30,7 +30,7 @@ from audio_probe import read_wav_tail, judge   # the audio liveness dial
 HERE = Path(__file__).resolve().parent
 LAB = HERE.parent / "lab"
 LAB.mkdir(exist_ok=True)
-PY = r"C:\Users\user\radioconda\python.exe"
+PY = sys.executable          # run helpers with the same python (radioconda)
 NRSC5 = r"C:\Tools\nrsc5\nrsc5.exe"
 MPV = r"C:\Program Files\MPV Player\mpv.exe"
 STATIONS = LAB / "stations.json"
