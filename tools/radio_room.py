@@ -63,6 +63,40 @@ def fm_demod_wav(iq, out_path, fs=FS, aud=48_000):
     return len(pcm) / aud
 
 
+def nerd_stats(iq, band, fs=FS):
+    """The stats-for-nerds snapshot: what the RF actually looked like."""
+    N = 8192
+    nseg = max(2, min(300, len(iq) // N))
+    seg = iq[:nseg * N].reshape(nseg, N) * np.hanning(N).astype(np.float32)
+    P = (np.abs(np.fft.fftshift(np.fft.fft(seg, axis=1), axes=1)) ** 2).mean(axis=0)
+    db = 10 * np.log10(P + 1e-12)
+    med = float(np.median(db))
+    binw = fs / N
+    c = N // 2
+    span_hz = 120e3 if band == "fm" else 8e3
+    k = int(span_hz / binw)
+    win = (db[c - k:c + k] - med).astype(np.float32)
+    pool = max(1, len(win) // 64)
+    spec = [round(float(x), 1) for x in
+            win[:len(win) // pool * pool].reshape(-1, pool).mean(axis=1)]
+    pk_i = int(np.argmax(win))
+    rf_snr = round(float(win[pk_i]), 1)
+    off_hz = round((pk_i - k) * binw)
+    # envelope ride: 100 ms cells across the capture (fades + AGC's job)
+    cell = int(0.1 * fs)
+    env = np.abs(iq[:len(iq) // cell * cell]).reshape(-1, cell).mean(axis=1)
+    env_db = 20 * np.log10(env / (float(np.median(env)) + 1e-12) + 1e-9)
+    pool2 = max(1, len(env_db) // 80)
+    ride = [round(float(x), 1) for x in
+            env_db[:len(env_db) // pool2 * pool2].reshape(-1, pool2).mean(axis=1)]
+    qsb = round(float(np.percentile(env_db, 95) - np.percentile(env_db, 5)), 1)
+    lvl = round(20 * np.log10(float(np.sqrt(np.mean(np.abs(iq) ** 2))) + 1e-12), 1)
+    return {"band": band, "rf_snr_db": rf_snr, "offset_hz": off_hz,
+            "level_dbfs": lvl, "qsb_db": qsb,
+            "chan_bw": "±100 kHz" if band == "fm" else "±6.25 kHz",
+            "spec": spec, "ride": ride}
+
+
 def grade_audio(wav_path):
     """Honest quality dial: speech-band energy vs hiss-band energy."""
     with wave.open(str(wav_path), "rb") as w:
@@ -96,13 +130,16 @@ def do_listen(band, freq_khz, secs=25):
         sdr.deactivateStream(st)
         sdr.closeStream(st)
         STATE.update({"phase": "demod", "msg": "demodulating"})
+        nerd = nerd_stats(iq, band)
         if band == "fm":
             fm_demod_wav(iq, WAV)
         else:
             am_demod_wav(iq, WAV)
         q = grade_audio(WAV)
+        nerd.update({"audio_snr_db": q["snr_db"], "grade": q["grade"]})
         STATE.update({"phase": "ready",
                       "msg": f"{freq_khz:g} kHz - audio SNR {q['snr_db']} dB ({q['grade']})",
+                      "nerd": nerd,
                       "last": {"khz": freq_khz, "band": band, **q,
                                "ts": time.time()}})
     except Exception as e:
@@ -166,7 +203,18 @@ button:hover{border-color:#33d0c4}
 .b-am td:first-child{color:#8a7dff}
 </style></head><body>
 <h1>RADIO ROOM - click to listen (25 s capture, quality-graded)</h1>
-<div id="bar"><span id="msg">idle</span><audio id="au" controls></audio></div>
+<div id="bar"><span id="msg">idle</span>
+<button id="nbtn" style="float:right" onclick="nerdToggle()">STATS FOR NERDS</button>
+<audio id="au" controls></audio>
+<div id="nerd" style="display:none;margin-top:10px;border-top:1px solid #20272f;padding-top:10px">
+  <div id="knobs" style="display:grid;grid-template-columns:repeat(auto-fill,minmax(130px,1fr));gap:8px"></div>
+  <div style="display:flex;gap:14px;margin-top:10px;flex-wrap:wrap">
+    <div><div style="color:#7c8794;font-size:11px">SPECTRUM (around carrier)</div>
+      <canvas id="spec" width="340" height="90" style="background:#0a0d11;border:1px solid #1b232d"></canvas></div>
+    <div><div style="color:#7c8794;font-size:11px">FADE / AGC RIDE (capture timeline)</div>
+      <canvas id="ride" width="340" height="90" style="background:#0a0d11;border:1px solid #1b232d"></canvas></div>
+  </div>
+</div></div>
 <table><thead><tr><th>STATION</th><th>RF SNR</th><th>WHO</th><th></th></tr></thead>
 <tbody id="rows"></tbody></table>
 <script>
@@ -185,13 +233,45 @@ async function listen(band,khz){
   poll();
 }
 let t=null;
+function nerdToggle(){let n=document.getElementById('nerd');
+  n.style.display=n.style.display==='none'?'block':'none';}
+function knob(k,v,unit){return `<div style="background:#0a0d11;border:1px solid #1b232d;
+  border-radius:6px;padding:6px 10px"><div style="color:#7c8794;font-size:10px;
+  letter-spacing:.1em">${k}</div><div style="color:#ffb43a;font-size:17px">${v}
+  <span style="font-size:11px;color:#7c8794">${unit||''}</span></div></div>`;}
+function scope(id,data,color){
+  let cv=document.getElementById(id),ctx=cv.getContext('2d');
+  ctx.clearRect(0,0,cv.width,cv.height);
+  if(!data||!data.length)return;
+  let mn=Math.min(...data),mx=Math.max(...data),rng=(mx-mn)||1;
+  ctx.strokeStyle=color;ctx.lineWidth=1.6;ctx.beginPath();
+  data.forEach((v,i)=>{let x=i/(data.length-1)*cv.width;
+    let y=cv.height-6-((v-mn)/rng)*(cv.height-14);
+    i?ctx.lineTo(x,y):ctx.moveTo(x,y);});
+  ctx.stroke();
+  ctx.fillStyle='#7c8794';ctx.font='9px monospace';
+  ctx.fillText(mx.toFixed(0)+' dB',4,10);ctx.fillText(mn.toFixed(0)+' dB',4,cv.height-3);}
+function renderNerd(n){
+  if(!n)return;
+  document.getElementById('knobs').innerHTML=
+    knob('MODE',n.band.toUpperCase()+' '+n.chan_bw,'')+
+    knob('RF SNR',n.rf_snr_db,'dB')+
+    knob('CARRIER OFFSET',n.offset_hz,'Hz')+
+    knob('INPUT LEVEL',n.level_dbfs,'dBFS')+
+    knob('QSB FADE DEPTH',n.qsb_db,'dB')+
+    knob('AUDIO SNR',n.audio_snr_db,'dB')+
+    knob('GRADE',n.grade,'');
+  scope('spec',n.spec,'#ffb43a');scope('ride',n.ride,'#33d0c4');}
 async function poll(){
   clearTimeout(t);
   let r=await fetch('/api/status');let s=await r.json();
   document.getElementById('msg').textContent=s.msg||s.phase;
+  if(s.nerd)renderNerd(s.nerd);
   if(s.phase==='ready'&&s.last){
     let au=document.getElementById('au');
-    au.src='/audio?ts='+s.last.ts;au.play().catch(()=>{});
+    let want='/audio?ts='+s.last.ts;
+    if(!au.src.endsWith(want)){au.src=want;au.play().catch(()=>{});}
+    t=setTimeout(poll,3000);
   } else { t=setTimeout(poll,1500); }
 }
 load();poll();
