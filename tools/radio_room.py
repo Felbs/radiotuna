@@ -73,7 +73,7 @@ def nerd_stats(iq, band, fs=FS):
     med = float(np.median(db))
     binw = fs / N
     c = N // 2
-    span_hz = 120e3 if band == "fm" else 8e3
+    span_hz = 120e3 if band == "fm" else (15e3 if band == "wx" else 8e3)
     k = int(span_hz / binw)
     win = (db[c - k:c + k] - med).astype(np.float32)
     pool = max(1, len(win) // 64)
@@ -93,8 +93,35 @@ def nerd_stats(iq, band, fs=FS):
     lvl = round(20 * np.log10(float(np.sqrt(np.mean(np.abs(iq) ** 2))) + 1e-12), 1)
     return {"band": band, "rf_snr_db": rf_snr, "offset_hz": off_hz,
             "level_dbfs": lvl, "qsb_db": qsb,
-            "chan_bw": "±100 kHz" if band == "fm" else "±6.25 kHz",
+            "chan_bw": ("±100 kHz" if band == "fm"
+                        else "±12.5 kHz" if band == "wx" else "±6.25 kHz"),
             "spec": spec, "ride": ride}
+
+
+def nbfm_demod_wav(iq, out_path, fs=FS, aud=48_000):
+    """Narrowband FM (NOAA Weather Radio): +-12.5 kHz channel, then the
+    same discriminator -> voice shaping -> AGC chain."""
+    from scipy.signal import resample_poly, butter, sosfilt
+    from math import gcd
+    chan = 25_000
+    g = gcd(chan, int(fs))
+    x = resample_poly(iq, chan // g, int(fs) // g).astype(np.complex64)
+    disc = np.angle(x[1:] * np.conj(x[:-1])).astype(np.float32)
+    g2 = gcd(int(aud), chan)
+    audio = resample_poly(disc, int(aud) // g2, chan // g2).astype(np.float32)
+    sos = butter(4, [150, 4000], btype="band", fs=aud, output="sos")
+    audio = sosfilt(sos, audio).astype(np.float32)
+    k = aud
+    p = np.convolve(audio ** 2, np.ones(k, np.float32) / k, mode="same")
+    gain = np.clip(0.25 / (np.sqrt(p) + 1e-4), 0, 60.0)
+    audio = np.clip(audio * gain, -0.95, 0.95)
+    pcm = (audio * 32767).astype(np.int16)
+    with wave.open(str(out_path), "wb") as w:
+        w.setnchannels(1)
+        w.setsampwidth(2)
+        w.setframerate(aud)
+        w.writeframes(pcm.tobytes())
+    return len(pcm) / aud
 
 
 def grade_audio(wav_path):
@@ -133,6 +160,8 @@ def do_listen(band, freq_khz, secs=25):
         nerd = nerd_stats(iq, band)
         if band == "fm":
             fm_demod_wav(iq, WAV)
+        elif band == "wx":
+            nbfm_demod_wav(iq, WAV)
         else:
             am_demod_wav(iq, WAV)
         q = grade_audio(WAV)
@@ -179,6 +208,17 @@ def build_rows():
         rows.append({"band": "sw", "khz": float(s["khz"]),
                      "label": f"{s['khz']} kHz SW", "snr": s["snr_db"],
                      "name": nm})
+    # always-present classics (no survey needed)
+    for k in (162.400, 162.425, 162.450, 162.475, 162.500, 162.525, 162.550):
+        rows.append({"band": "wx", "khz": k * 1000,
+                     "label": f"{k:.3f} WX", "snr": "-",
+                     "name": "NOAA Weather Radio"})
+    for khz, nm in ((5000, "WWV time signal (NIST)"),
+                    (10000, "WWV time signal (NIST)"),
+                    (15000, "WWV time signal (NIST)"),
+                    (7850, "CHU Canada time signal")):
+        rows.append({"band": "sw", "khz": float(khz),
+                     "label": f"{khz} kHz SW", "snr": "-", "name": nm})
     return rows
 
 
@@ -203,6 +243,16 @@ button:hover{border-color:#33d0c4}
 .b-am td:first-child{color:#8a7dff}
 </style></head><body>
 <h1>RADIO ROOM - click to listen (25 s capture, quality-graded)</h1>
+<div style="margin-bottom:10px">
+  <button onclick="filt('all')">ALL</button>
+  <button onclick="filt('fm')">FM</button>
+  <button onclick="filt('am')">AM</button>
+  <button onclick="filt('sw')">SHORTWAVE</button>
+  <button onclick="filt('wx')">WEATHER</button>
+  <span style="color:#7c8794;margin-left:12px;font-size:12px">
+    HD subchannel audio lives in the HD listening room:
+    <a href="http://localhost:8643" style="color:#33d0c4">localhost:8643</a></span>
+</div>
 <div id="bar"><span id="msg">idle</span>
 <button id="nbtn" style="float:right" onclick="nerdToggle()">STATS FOR NERDS</button>
 <audio id="au" controls></audio>
@@ -233,6 +283,8 @@ async function listen(band,khz){
   poll();
 }
 let t=null;
+function filt(b){document.querySelectorAll('#rows tr').forEach(tr=>{
+  tr.style.display=(b==='all'||tr.className==='b-'+b)?'':'none';});}
 function nerdToggle(){let n=document.getElementById('nerd');
   n.style.display=n.style.display==='none'?'block':'none';}
 function knob(k,v,unit){return `<div style="background:#0a0d11;border:1px solid #1b232d;
