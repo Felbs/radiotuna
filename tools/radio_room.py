@@ -252,6 +252,19 @@ button:hover{border-color:#33d0c4}
   <span style="color:#7c8794;margin-left:12px;font-size:12px">
     HD subchannel audio lives in the HD listening room:
     <a href="http://localhost:8643" style="color:#33d0c4">localhost:8643</a></span>
+  <span style="margin-left:18px">
+    <input id="tf" type="number" step="any" placeholder="kHz"
+      style="width:110px;background:#0a0d11;color:#eaf0f6;border:1px solid #20272f;
+      border-radius:6px;padding:3px 8px;font-family:inherit">
+    <select id="tm" style="background:#0a0d11;color:#eaf0f6;border:1px solid #20272f;
+      border-radius:6px;padding:3px;font-family:inherit">
+      <option value="sw">AM (SW/MW/air/CB)</option>
+      <option value="wx">NBFM (VHF voice)</option>
+      <option value="fm">WBFM (broadcast)</option>
+    </select>
+    <button onclick="manualTune()">TUNE</button>
+    <span style="color:#7c8794;font-size:11px">air 118000-137000 · CB 26965-27405 ·
+      pirates ~6925 · NDB 190-535</span></span>
 </div>
 <div id="bar"><span id="msg">idle</span>
 <button id="nbtn" style="float:right" onclick="nerdToggle()">STATS FOR NERDS</button>
@@ -285,6 +298,8 @@ async function listen(band,khz){
 let t=null;
 function filt(b){document.querySelectorAll('#rows tr').forEach(tr=>{
   tr.style.display=(b==='all'||tr.className==='b-'+b)?'':'none';});}
+function manualTune(){let k=parseFloat(document.getElementById('tf').value);
+  if(!k)return;listen(document.getElementById('tm').value,k);}
 function nerdToggle(){let n=document.getElementById('nerd');
   n.style.display=n.style.display==='none'?'block':'none';}
 function knob(k,v,unit){return `<div style="background:#0a0d11;border:1px solid #1b232d;
