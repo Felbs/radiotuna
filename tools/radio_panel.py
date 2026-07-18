@@ -79,7 +79,26 @@ LOCK = threading.Lock()
 LIVE_PROCS = []
 
 
+def _ensure_sdr_dll_path():
+    """Bare (non-activated) python can't find the SoapySDR driver DLLs;
+    without this every open fails and the panel cries RADIO UNAVAILABLE
+    even with the radio sitting idle (bit us 2026-07-18)."""
+    if _os.name != "nt":
+        return
+    root = Path(sys.executable).resolve().parent
+    for p in (root / "Library" / "bin",
+              Path(r"C:\Program Files\SDRplay\API\x64"),
+              Path(r"C:\Program Files\SDRplay\API")):
+        if p.is_dir():
+            _os.environ["PATH"] = str(p) + _os.pathsep + _os.environ["PATH"]
+            try:
+                _os.add_dll_directory(str(p))
+            except Exception:
+                pass
+
+
 def open_sdr(mhz, ifgr=59.0, rfgain="3", rate=FS_CAP):
+    _ensure_sdr_dll_path()
     import SoapySDR
     from SoapySDR import SOAPY_SDR_RX, SOAPY_SDR_CS16
     SoapySDR.SoapySDR_setLogLevel(SoapySDR.SOAPY_SDR_FATAL)
