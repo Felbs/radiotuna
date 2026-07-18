@@ -310,7 +310,22 @@ def run_survey():
 
 
 # ── listening ──────────────────────────────────────────────────────
+def _cal_gains(mhz, ifgr, rfgain):
+    """Learned per-station gains (hd_quality.py sweeps) beat the one-size
+    default - at the HD cliff the measured optimum is the difference
+    between music and static (wired in 2026-07-18, the GAINS-table law)."""
+    try:
+        cal = json.loads((LAB / "hd_gain_cal.json").read_text())
+        c = cal.get(f"{mhz:.1f}")
+        if c and c.get("mer_db") is not None:
+            return float(c["ifgr"]), str(c["rfgain"])
+    except Exception:
+        pass
+    return ifgr, str(rfgain)
+
+
 def listen(mhz, prog, name, ifgr=59, rfgain="3"):
+    ifgr, rfgain = _cal_gains(mhz, ifgr, rfgain)
     stop_listen()
     time.sleep(1)
     with LOCK:
