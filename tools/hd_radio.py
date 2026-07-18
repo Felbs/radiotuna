@@ -39,7 +39,26 @@ FS_NRSC5 = 1_488_375.0
 FS_CAP = 2 * FS_NRSC5          # capture at 2x, decimate by 2
 
 
+def _ensure_sdr_dll_path():
+    """Bare (non-activated) python can't find the SoapySDR driver DLLs -
+    the standard shim every other tool in the family carries."""
+    import os
+    if os.name != "nt":
+        return
+    root = Path(sys.executable).resolve().parent
+    for p in (root / "Library" / "bin",
+              Path(r"C:\Program Files\SDRplay\API\x64"),
+              Path(r"C:\Program Files\SDRplay\API")):
+        if p.is_dir():
+            os.environ["PATH"] = str(p) + os.pathsep + os.environ["PATH"]
+            try:
+                os.add_dll_directory(str(p))
+            except Exception:
+                pass
+
+
 def open_sdr(mhz, ifgr=40.0, rfgain="3"):
+    _ensure_sdr_dll_path()
     import SoapySDR
     from SoapySDR import SOAPY_SDR_RX, SOAPY_SDR_CS16
     SoapySDR.SoapySDR_setLogLevel(SoapySDR.SOAPY_SDR_FATAL)
