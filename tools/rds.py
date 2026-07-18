@@ -67,9 +67,15 @@ def costas_bpsk(mpx, fs, fc=57000.0):
     dec_fs = int(round(RBPS * 8))          # 9500 Hz, 8 samples/bit
     g = gcd(dec_fs, int(fs))
     z = resample_poly(z, dec_fs // g, int(fs) // g).astype(np.complex64)
+    # AGC to unit RMS: the loop error term (Re*Im) scales with signal
+    # power^2 - at RDS's few-percent injection the un-normalized error
+    # was ~1e-4 x loop gain = a loop that never actually pulled. Found
+    # 2026-07-18: locked-BPSK I/Q power split measured 0 dB (= unlocked)
+    # while the differential decoder limped along at ~15% block rate.
+    z = (z / (np.sqrt(np.mean(np.abs(z) ** 2)) + 1e-12)).astype(np.complex64)
     phase = 0.0
     freq = 0.0
-    a, b = 0.01, 0.01 ** 2 / 4
+    a, b = 0.02, 0.02 ** 2 / 4
     out = np.empty(len(z), np.complex64)
     for i in range(len(z)):
         v = z[i] * np.exp(-1j * phase)
@@ -81,18 +87,22 @@ def costas_bpsk(mpx, fs, fc=57000.0):
 
 
 def bits_from_symbols(rec, fs):
-    """1187.5 bps clock recovery (Gardner-lite) -> differential bits."""
+    """1187.5 bps symbol sampling at the EYE CENTER (best of sps phases,
+    judged by mean |Re| - the balloon campaign's timing lesson), then
+    differential decode."""
     sps = fs / RBPS
     n = int(len(rec) / sps) - 2
-    syms = np.empty(n, np.complex64)
-    pos = 0.0
-    for k in range(n):
-        p = int(pos)
-        if p >= len(rec):
-            syms = syms[:k]; break
-        syms[k] = rec[p]
-        pos += sps
-    bit = (np.real(syms) > 0).astype(np.int8)
+    base = np.arange(n) * sps
+    best = (-1.0, 0)
+    for ph in range(int(round(sps))):
+        idx = (base + ph).astype(int)
+        idx = idx[idx < len(rec)]
+        m = float(np.mean(np.abs(np.real(rec[idx]))))
+        if m > best[0]:
+            best = (m, ph)
+    idx = (base + best[1]).astype(int)
+    idx = idx[idx < len(rec)]
+    bit = (np.real(rec[idx]) > 0).astype(np.int8)
     # RDS is differentially encoded: transition = 1
     return (bit[1:] ^ bit[:-1]).astype(np.int8)
 
