@@ -117,6 +117,40 @@ def open_sdr(mhz, ifgr=59.0, rfgain="3", rate=FS_CAP):
         pass
     st = sdr.setupStream(SOAPY_SDR_RX, SOAPY_SDR_CS16)
     sdr.activateStream(st)
+    # DUD-BURNER (law: the first session after a driver-service restart
+    # often opens fine but streams ZEROS - the user hears static on a
+    # perfectly strong station). Probe a short burst; if it's silence,
+    # burn this session and reopen once.
+    try:
+        probe = np.empty(2 * 65536, np.int16)
+        got = 0
+        pk = 0
+        t0 = time.time()
+        while got < 4 * 65536 and time.time() - t0 < 2.0:
+            r = sdr.readStream(st, [probe], 65536, timeoutUs=500000)
+            if r.ret > 0:
+                got += r.ret
+                pk = max(pk, int(np.abs(probe[:2 * r.ret]).max()))
+        if got == 0 or pk < 20:      # zeros or near-zeros = dud session
+            close_sdr(sdr, st)
+            time.sleep(0.5)
+            sdr = SoapySDR.Device("driver=sdrplay")
+            sdr.setSampleRate(SOAPY_SDR_RX, 0, rate)
+            sdr.setFrequency(SOAPY_SDR_RX, 0, mhz * 1e6)
+            sdr.setAntenna(SOAPY_SDR_RX, 0, "Antenna A")
+            try:
+                sdr.setGainMode(SOAPY_SDR_RX, 0, False)
+            except Exception:
+                pass
+            sdr.setGain(SOAPY_SDR_RX, 0, "IFGR", ifgr)
+            try:
+                sdr.writeSetting("rfgain_sel", str(rfgain))
+            except Exception:
+                pass
+            st = sdr.setupStream(SOAPY_SDR_RX, SOAPY_SDR_CS16)
+            sdr.activateStream(st)
+    except Exception:
+        pass
     return sdr, st
 
 
