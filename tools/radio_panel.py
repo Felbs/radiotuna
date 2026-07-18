@@ -31,8 +31,12 @@ HERE = Path(__file__).resolve().parent
 LAB = HERE.parent / "lab"
 LAB.mkdir(exist_ok=True)
 PY = sys.executable          # run helpers with the same python (radioconda)
-NRSC5 = r"C:\Tools\nrsc5\nrsc5.exe"
-MPV = r"C:\Program Files\MPV Player\mpv.exe"
+import os as _os
+import shutil as _sh
+NRSC5 = (_os.environ.get("NRSC5_EXE") or _sh.which("nrsc5")
+         or r"C:\Tools\nrsc5\nrsc5.exe")
+MPV = (_os.environ.get("MPV_EXE") or _sh.which("mpv")
+       or r"C:\Program Files\MPV Player\mpv.exe")
 STATIONS = LAB / "stations.json"
 PORT = 8643
 FS_NRSC5 = 1_488_375.0

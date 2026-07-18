@@ -37,6 +37,17 @@ PORT = 8645
 STATE = {"phase": "idle", "msg": "", "last": None}
 LOCK = threading.Lock()
 
+# tell the observatory a human is on the dial (the warden pauses
+# rotations while this flag stays fresh; lab/ is gitignored)
+USER_FLAG = LAB / "user_on_air.flag"
+
+
+def _touch_user_flag():
+    try:
+        USER_FLAG.touch()
+    except OSError:
+        pass
+
 
 def fm_demod_wav(iq, out_path, fs=FS, aud=48_000):
     """Mono WBFM with deemphasis + the same shaping/AGC philosophy."""
@@ -98,6 +109,116 @@ def nerd_stats(iq, band, fs=FS):
             "spec": spec, "ride": ride}
 
 
+def am_truth_dials(iq, fs=FS):
+    """The MER method transplanted to AM: the signal's KNOWN parts are the
+    carrier (should be a constant) and the sideband mirror-symmetry (audio
+    is transmitted twice). Their errors are live channel-quality dials that
+    need no knowledge of the program material."""
+    from scipy.signal import resample_poly, firwin, filtfilt
+    from math import gcd
+    aud = 20_000
+    g = gcd(aud, int(fs))
+    x = resample_poly(iq, aud // g, int(fs) // g).astype(np.complex64)
+    # nail the exact carrier near DC and center on it
+    N = 1 << 14
+    seg = x[:len(x) // N * N].reshape(-1, N) * np.hanning(N).astype(np.float32)
+    P = (np.abs(np.fft.fftshift(np.fft.fft(seg, axis=1), axes=1)) ** 2).mean(axis=0)
+    fr = np.fft.fftshift(np.fft.fftfreq(N, 1 / aud))
+    m = np.abs(fr) < 600.0
+    doff = fr[m][np.argmax(P[m])]
+    n = np.arange(len(x), dtype=np.float64)
+    x = x * np.exp(-2j * np.pi * doff / aud * n).astype(np.complex64)
+    # CARRIER MER: amplitude stability of the carrier (mean^2 / wobble
+    # power of |carrier|). Amplitude-only on purpose - residual sub-Hz
+    # tuning error rotates the phase and would zero a complex mean.
+    c = filtfilt(firwin(1025, 30.0 / (aud / 2)), [1.0], x)
+    amp = np.abs(c)
+    cmer = 10 * np.log10(float(np.mean(amp)) ** 2 /
+                         max(float(np.var(amp)), 1e-15))
+    # SIDEBAND SYMMETRY: fold the PSD around the carrier, 100 Hz - 5 kHz
+    seg = x[:len(x) // N * N].reshape(-1, N) * np.hanning(N).astype(np.float32)
+    P = (np.abs(np.fft.fftshift(np.fft.fft(seg, axis=1), axes=1)) ** 2).mean(axis=0)
+    hi = (fr > 100) & (fr < 5000)
+    lo = (fr < -100) & (fr > -5000)
+    U = P[hi]
+    L = P[lo][::-1][:len(U)]
+    U = U[:len(L)]
+    sym = 10 * np.log10(np.minimum(U, L).sum() / max(np.abs(U - L).sum(), 1e-15))
+    tilt = 10 * np.log10(U.sum() / max(L.sum(), 1e-15))
+    return {"carrier_mer_db": round(float(cmer), 1),
+            "sideband_sym_db": round(float(sym), 1),
+            "sideband_tilt_db": round(float(tilt), 1)}
+
+
+def fm_truth_dials(iq, fs=FS):
+    """FM's known parts: the 19 kHz pilot (a pure tone) and the RDS BPSK
+    constellation at 57 kHz - actual, literal MER plus a block-CRC truth
+    dial, exactly the fs_err_rms/TS-error pair from the TV campaign."""
+    from rds import (fm_discriminate, costas_bpsk, bits_from_symbols,
+                     find_blocks, decode_groups)
+    mpx = fm_discriminate(iq, fs)
+    N = 1 << 16
+    seg = mpx[:len(mpx) // N * N].reshape(-1, N) * np.hanning(N).astype(np.float32)
+    P = (np.abs(np.fft.rfft(seg, axis=1)) ** 2).mean(axis=0)
+    fr = np.fft.rfftfreq(N, 1 / fs)
+    pk = P[(fr > 18900) & (fr < 19100)].max()
+    flo = np.median(P[((fr > 18100) & (fr < 18700)) | ((fr > 19300) & (fr < 19900))])
+    pilot = 10 * np.log10(pk / max(flo, 1e-15))
+    out = {"pilot_snr_db": round(float(pilot), 1)}
+    try:
+        rec, dfs = costas_bpsk(mpx, fs)
+        # Honest MER independent of the Costas loop (whose error term is
+        # too amplitude-starved to lock at RDS injection levels): block-
+        # wise z^2 phase (squaring strips BPSK modulation), derotate,
+        # matched-filter one chip, then MER on the 2375 Hz chip lattice
+        # (RDS is biphase - the bit-rate lattice lands on zero crossings).
+        blk = max(1, int(0.025 * dfs))
+        z = rec[int(0.2 * dfs):].copy()
+        nblk = len(z) // blk
+        prev = 0.0
+        for i in range(nblk):
+            seg = z[i * blk:(i + 1) * blk]
+            phi = 0.5 * np.angle(np.mean(seg ** 2))
+            # +/-90deg ambiguity: stay continuous with the previous block
+            while phi - prev > np.pi / 2:
+                phi -= np.pi
+            while phi - prev < -np.pi / 2:
+                phi += np.pi
+            z[i * blk:(i + 1) * blk] = seg * np.exp(-1j * phi)
+            prev = phi
+        chip = max(1, int(round(dfs / 2375.0)))
+        z = np.convolve(z, np.ones(chip, np.float32) / chip, mode="same")
+        sps = dfs / 2375.0
+        base = np.arange(int(len(z) / sps) - 2) * sps
+        best_mer = None
+        for ph in range(int(np.ceil(sps))):
+            idx = (base + ph).astype(int)
+            idx = idx[idx < len(z)]
+            syms = z[idx]
+            re, im = np.real(syms), np.imag(syms)
+            mag = float(np.mean(np.abs(re)))
+            err = float(np.mean((np.abs(re) - mag) ** 2 + im ** 2))
+            mer = 10 * np.log10(mag ** 2 / max(err, 1e-15))
+            if best_mer is None or mer > best_mer:
+                best_mer = mer
+        out["rds_mer_db"] = round(best_mer, 1)
+        best = {"groups": 0}
+        for inv in (rec, -rec):
+            bits = bits_from_symbols(inv, dfs)
+            for flip in (bits, bits ^ 1):
+                gr = find_blocks(flip)
+                if len(gr) > best["groups"]:
+                    best = decode_groups(gr)
+        out["rds_groups"] = best.get("groups", 0)
+        if best.get("ps"):
+            out["rds_ps"] = best["ps"]
+        if best.get("pi"):
+            out["rds_pi"] = best["pi"]
+    except Exception:
+        pass
+    return out
+
+
 def nbfm_demod_wav(iq, out_path, fs=FS, aud=48_000):
     """Narrowband FM (NOAA Weather Radio): +-12.5 kHz channel, then the
     same discriminator -> voice shaping -> AGC chain."""
@@ -124,18 +245,35 @@ def nbfm_demod_wav(iq, out_path, fs=FS, aud=48_000):
     return len(pcm) / aud
 
 
-def grade_audio(wav_path):
-    """Honest quality dial: speech-band energy vs hiss-band energy."""
+def grade_audio(wav_path, band="fm"):
+    """Honest quality dial. FM: speech-band vs hiss-band energy (its audio
+    extends past 5 kHz, so 5-7 kHz really is hiss). AM/SW/WX: the demod
+    chain lowpasses at 4.5 kHz, so 5-7 kHz is the FILTER's stopband, not
+    the air - grade instead by the pause floor INSIDE the passband
+    (program pauses reveal noise AND co-channel garble underneath)."""
     with wave.open(str(wav_path), "rb") as w:
         fr = w.getframerate()
         x = np.frombuffer(w.readframes(w.getnframes()), np.int16).astype(np.float32)
     if len(x) < fr:
         return {"snr_db": 0, "grade": "?"}
-    spec = np.abs(np.fft.rfft(x[: fr * 20] * np.hanning(min(len(x), fr * 20)))) ** 2
-    freqs = np.fft.rfftfreq(min(len(x), fr * 20), 1 / fr)
-    sp = spec[(freqs > 300) & (freqs < 3000)].mean()
-    hiss = spec[(freqs > 5000) & (freqs < 7000)].mean() + 1e-9
-    snr = 10 * np.log10(sp / hiss)
+    if band == "fm":
+        spec = np.abs(np.fft.rfft(x[: fr * 20] * np.hanning(min(len(x), fr * 20)))) ** 2
+        freqs = np.fft.rfftfreq(min(len(x), fr * 20), 1 / fr)
+        sp = spec[(freqs > 300) & (freqs < 3000)].mean()
+        hiss = spec[(freqs > 5000) & (freqs < 7000)].mean() + 1e-9
+        snr = 10 * np.log10(sp / hiss)
+    else:
+        from scipy.signal import butter, sosfilt
+        sos = butter(4, [300, 3400], btype="band", fs=fr, output="sos")
+        v = sosfilt(sos, x).astype(np.float32)
+        blk = int(0.05 * fr)
+        nb = len(v) // blk
+        e = (v[:nb * blk].reshape(nb, blk) ** 2).mean(axis=1)
+        p85, p15 = np.percentile(e, 85), np.percentile(e, 15)
+        snr = 10 * np.log10(max(p85, 1e-12) / max(p15, 1e-12))
+        grade = ("EXCELLENT" if snr > 16 else "GOOD" if snr > 10
+                 else "FAIR" if snr > 5 else "POOR")
+        return {"snr_db": round(float(snr), 1), "grade": grade}
     grade = ("EXCELLENT" if snr > 25 else "GOOD" if snr > 15
              else "FAIR" if snr > 8 else "POOR")
     return {"snr_db": round(float(snr), 1), "grade": grade}
@@ -148,7 +286,22 @@ def do_listen(band, freq_khz, secs=25):
         STATE.update({"phase": "capturing",
                       "msg": f"tuning {freq_khz:g} kHz ({band})"})
     try:
-        sdr, st = open_sdr("Antenna C" if band != "fm" else "Antenna A")
+        _touch_user_flag()
+        sdr = st = None
+        for attempt in range(12):
+            try:
+                sdr, st = open_sdr("Antenna C" if band != "fm" else "Antenna A")
+                break
+            except Exception as e:
+                busy = "no available RSP" in str(e) or "Device_make" in str(e) \
+                       or "Device::make" in str(e)
+                if not busy or attempt == 11:
+                    raise
+                STATE.update({"phase": "capturing",
+                              "msg": (f"radio busy (a warden test is finishing) - "
+                                      f"holding your place, attempt {attempt + 1}/12")})
+                _touch_user_flag()
+                time.sleep(15)
         import SoapySDR
         from SoapySDR import SOAPY_SDR_RX
         sdr.setFrequency(SOAPY_SDR_RX, 0, freq_khz * 1e3)
@@ -158,19 +311,27 @@ def do_listen(band, freq_khz, secs=25):
         sdr.closeStream(st)
         STATE.update({"phase": "demod", "msg": "demodulating"})
         nerd = nerd_stats(iq, band)
+        try:                       # truth dials must never break a listen
+            if band in ("am", "sw"):
+                nerd.update(am_truth_dials(iq))
+            elif band == "fm":
+                nerd.update(fm_truth_dials(iq))
+        except Exception:
+            pass
         if band == "fm":
             fm_demod_wav(iq, WAV)
         elif band == "wx":
             nbfm_demod_wav(iq, WAV)
         else:
             am_demod_wav(iq, WAV)
-        q = grade_audio(WAV)
+        q = grade_audio(WAV, band)
         nerd.update({"audio_snr_db": q["snr_db"], "grade": q["grade"]})
         STATE.update({"phase": "ready",
                       "msg": f"{freq_khz:g} kHz - audio SNR {q['snr_db']} dB ({q['grade']})",
                       "nerd": nerd,
                       "last": {"khz": freq_khz, "band": band, **q,
                                "ts": time.time()}})
+        _touch_user_flag()          # TTL runs from the END of a listen
     except Exception as e:
         busy = "no available RSP" in str(e) or "Device_make" in str(e)
         STATE.update({"phase": "idle",
@@ -320,7 +481,7 @@ function scope(id,data,color){
   ctx.fillText(mx.toFixed(0)+' dB',4,10);ctx.fillText(mn.toFixed(0)+' dB',4,cv.height-3);}
 function renderNerd(n){
   if(!n)return;
-  document.getElementById('knobs').innerHTML=
+  let h=
     knob('MODE',n.band.toUpperCase()+' '+n.chan_bw,'')+
     knob('RF SNR',n.rf_snr_db,'dB')+
     knob('CARRIER OFFSET',n.offset_hz,'Hz')+
@@ -328,6 +489,14 @@ function renderNerd(n){
     knob('QSB FADE DEPTH',n.qsb_db,'dB')+
     knob('AUDIO SNR',n.audio_snr_db,'dB')+
     knob('GRADE',n.grade,'');
+  if(n.carrier_mer_db!==undefined)h+=knob('CARRIER MER',n.carrier_mer_db,'dB');
+  if(n.sideband_sym_db!==undefined)h+=knob('SIDEBAND SYM',n.sideband_sym_db,'dB');
+  if(n.sideband_tilt_db!==undefined)h+=knob('SB TILT U/L',n.sideband_tilt_db,'dB');
+  if(n.pilot_snr_db!==undefined)h+=knob('19k PILOT SNR',n.pilot_snr_db,'dB');
+  if(n.rds_mer_db!==undefined)h+=knob('RDS MER',n.rds_mer_db,'dB');
+  if(n.rds_groups!==undefined)h+=knob('RDS GROUPS',n.rds_groups,'/capture');
+  if(n.rds_ps)h+=knob('RDS NAME',n.rds_ps+(n.rds_pi?' ['+n.rds_pi+']':''),'');
+  document.getElementById('knobs').innerHTML=h;
   scope('spec',n.spec,'#ffb43a');scope('ride',n.ride,'#33d0c4');}
 async function poll(){
   clearTimeout(t);

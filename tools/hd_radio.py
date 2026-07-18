@@ -29,8 +29,12 @@ import numpy as np
 HERE = Path(__file__).resolve().parent
 LAB = HERE.parent / "lab"          # project-root lab/, not tools/lab
 LAB.mkdir(exist_ok=True)
-NRSC5 = r"C:\Tools\nrsc5\nrsc5.exe"
-MPV = r"C:\Program Files\MPV Player\mpv.exe"
+import os as _os
+import shutil as _sh
+NRSC5 = (_os.environ.get("NRSC5_EXE") or _sh.which("nrsc5")
+         or r"C:\Tools\nrsc5\nrsc5.exe")
+MPV = (_os.environ.get("MPV_EXE") or _sh.which("mpv")
+       or r"C:\Program Files\MPV Player\mpv.exe")
 FS_NRSC5 = 1_488_375.0
 FS_CAP = 2 * FS_NRSC5          # capture at 2x, decimate by 2
 
