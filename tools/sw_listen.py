@@ -23,10 +23,29 @@ LAB = HERE.parent / "lab"
 MPV = r"C:\Program Files\MPV Player\mpv.exe"
 
 
-def am_demod_wav(iq, out_path, fs=FS, aud=48_000):
+def synchronous_am(x, chan_fs):
+    """Carrier-locked (synchronous) AM detection. A PLL tracks the carrier
+    phase so we demodulate I (in-phase) instead of |x| - this survives
+    selective fading, where the carrier fades but sidebands don't and an
+    envelope detector garbles. The FPLL idea from the TV decoder, on AM."""
+    phase = 0.0
+    freq = 0.0
+    a, b = 0.01, 0.01 ** 2 / 4
+    out = np.empty(len(x), np.float32)
+    for i in range(len(x)):
+        v = x[i] * (np.cos(-phase) + 1j * np.sin(-phase))
+        out[i] = v.real                    # in-phase = the AM audio
+        e = v.imag * (1.0 if v.real >= 0 else -1.0)   # phase error
+        freq += b * e
+        phase += freq + a * e
+    return out
+
+
+def am_demod_wav(iq, out_path, fs=FS, aud=48_000, sync=True):
     """Broadcast-quality AM: narrow channel filter FIRST (Law 4 - the
-    signal is ~10 kHz wide, not 250 kHz), then envelope, then voice-band
-    shaping and a slow AGC that rides shortwave's fades."""
+    signal is ~10 kHz wide, not 250 kHz), then SYNCHRONOUS detection
+    (carrier-locked, beats envelope under selective fading), then
+    voice-band shaping and a slow AGC that rides shortwave's fades."""
     from scipy.signal import resample_poly, butter, sosfilt
     from math import gcd
     # 1. channel filter: decimate 250k -> 12.5k (+-6.25 kHz) - this alone
@@ -34,7 +53,11 @@ def am_demod_wav(iq, out_path, fs=FS, aud=48_000):
     chan_fs = 12_500
     g = gcd(chan_fs, int(fs))
     x = resample_poly(iq, chan_fs // g, int(fs) // g).astype(np.complex64)
-    env = np.abs(x).astype(np.float32)
+    x = x - np.mean(x)
+    if sync:
+        env = synchronous_am(x, chan_fs)
+    else:
+        env = np.abs(x).astype(np.float32)
     env -= float(np.mean(env))
     # 2. voice-band shaping: 100 Hz - 4.5 kHz bandpass
     sos = butter(4, [100, 4500], btype="band", fs=chan_fs, output="sos")
