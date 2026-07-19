@@ -1,9 +1,11 @@
 ﻿"""radio_panel.py â€” Radio Tuna's listening room.  http://localhost:8643
 
-A classic receiver, rendered: big frequency readout, a tuning dial with
-every station the band survey found, HD subchannel buttons (the "grid"),
-live now-playing metadata scraped from the digital stream, and MER/BER
-meters. TV Tuna panel skeleton in a vintage cabinet.
+ALBACORE TUNA RADIO: big frequency readout, a tuning dial with every
+station the band survey found, HD subchannel buttons (the "grid"), live
+now-playing metadata, MER/BER meters, and a STATS FOR NERDS panel that
+streams the live knobs (FM pilot SNR / audio SNR / stereo blend / AGC,
+HD decoder identity, day-lab status). HD decodes through the albacore
+build (ALBACORE=1); analog FM through fm_stereo.py v2.
 
   SURVEY â€” two stages: wideband FFT sweep finds carriers (~10 s), then
            nrsc5 probes the strong ones for HD (name, slogan, programs).
@@ -26,6 +28,7 @@ import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from audio_probe import read_wav_tail, judge   # the audio liveness dial
+import fm_stereo                               # the v2 analog chain
 
 HERE = Path(__file__).resolve().parent
 LAB = HERE.parent / "lab"
@@ -33,8 +36,23 @@ LAB.mkdir(exist_ok=True)
 PY = sys.executable          # run helpers with the same python (radioconda)
 import os as _os
 import shutil as _sh
-NRSC5 = (_os.environ.get("NRSC5_EXE") or _sh.which("nrsc5")
-         or r"C:\Tools\nrsc5\nrsc5.exe")
+# HD decoder: prefer the albacore build (certified 1.77x audio with
+# ALBACORE=1) over stock nrsc5; NRSC5_EXE env still wins.
+ALBACORE_EXE = Path(r"Z:\src\albacore\build\src\nrsc5.exe")
+NRSC5 = (_os.environ.get("NRSC5_EXE")
+         or (str(ALBACORE_EXE) if ALBACORE_EXE.exists() else None)
+         or _sh.which("nrsc5") or r"C:\Tools\nrsc5\nrsc5.exe")
+DECODER_TAG = ("albacore ALBACORE=1" if "albacore" in NRSC5.lower()
+               else "stock nrsc5")
+
+
+def _nrsc5_env():
+    e = dict(_os.environ)
+    if "albacore" in NRSC5.lower():
+        e["PATH"] = r"C:\msys64\mingw64\bin;" + e["PATH"]
+        e.setdefault("ALBACORE", "1")
+        e.setdefault("ALBACORE_COSTAS_BW", "auto")
+    return e
 MPV = (_os.environ.get("MPV_EXE") or _sh.which("mpv")
        or r"C:\Program Files\MPV Player\mpv.exe")
 STATIONS = LAB / "stations.json"
@@ -45,7 +63,13 @@ FS_CAP = 2 * FS_NRSC5
 STATE = {"mhz": None, "prog": None, "name": None, "listening": False,
          "title": None, "artist": None, "mer_lo": None, "mer_hi": None,
          "ber": None, "sync": False, "stage": "", "pct": 0,
-         "audio": None}
+         "audio": None,
+         # stats-for-nerds: the knobs, live
+         "decoder": None, "pilot_snr_db": None, "audio_snr_db": None,
+         "stereo_blend": None, "fm_mode": None, "agc_db": None}
+
+FM_KEYS = ("pilot_snr_db", "audio_snr_db", "stereo_blend", "fm_mode",
+           "agc_db")
 
 
 def set_stage(pct, msg):
@@ -181,7 +205,9 @@ def stop_listen():
     with LOCK:
         GEN[0] += 1
         STATE.update({"listening": False, "mhz": None, "prog": None,
-                      "name": None, "sync": False, "stage": "", "pct": 0})
+                      "name": None, "sync": False, "stage": "", "pct": 0,
+                      "decoder": None})
+        STATE.update({k: None for k in FM_KEYS})
     for p in LIVE_PROCS:
         try:
             p.terminate()
@@ -256,7 +282,7 @@ def hd_probe(mhz, secs=8):
     p = subprocess.Popen([NRSC5, "-r", str(iq), str(0)],
                          stdin=keeper.stdout, stdout=subprocess.PIPE,
                          stderr=subprocess.STDOUT, text=True,
-                         errors="replace")
+                         errors="replace", env=_nrsc5_env())
     t0 = time.time()
 
     def reader():
@@ -400,8 +426,9 @@ def listen(mhz, prog, name, ifgr=59, rfgain="3"):
         nr = subprocess.Popen(
             [NRSC5, "-r", "-", "-o", str(wav), str(prog)],
             stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT, text=False)
+            stderr=subprocess.STDOUT, text=False, env=_nrsc5_env())
         LIVE_PROCS.append(nr)
+        STATE["decoder"] = DECODER_TAG
         info = {}
 
         def scrape():
@@ -487,9 +514,10 @@ def listen(mhz, prog, name, ifgr=59, rfgain="3"):
 
 
 def listen_fm(mhz, name, ifgr=59, rfgain="3"):
-    """Analog FM v1: pure-numpy WFM demod (mono + 75us de-emphasis) at
-    the pump, growing WAV, mpv tails it. Stereo + pilot-SNR telemetry
-    arrive with the gr-based path (campaign upgrade)."""
+    """Analog FM v2 (fm_stereo.py): channel-select FIR, pilot-locked
+    stereo with SNR-adaptive mono blend, 15 kHz audio filtering, live
+    truth dials. The v1 path shipped the whole unfiltered composite
+    (0-46 kHz) into the WAV — that WAS the hiss."""
     stop_listen()
     time.sleep(1)
     with LOCK:
@@ -497,12 +525,12 @@ def listen_fm(mhz, name, ifgr=59, rfgain="3"):
         my_gen = GEN[0]
         STATE.update({"mhz": mhz, "prog": None, "name": name + " (analog)",
                       "listening": True, "sync": False,
-                      "title": name, "artist": "analog FM â€” mono v1",
-                      "mer_lo": None, "mer_hi": None, "ber": None})
+                      "title": name, "artist": "analog FM â€” stereo v2",
+                      "mer_lo": None, "mer_hi": None, "ber": None,
+                      "decoder": "fm_stereo v2 (blend)"})
     set_stage(15, "opening the radio (analog FM)")
 
     def worker():
-        import struct
         sdr = st = None
         for attempt in range(4):
             try:
@@ -518,63 +546,49 @@ def listen_fm(mhz, name, ifgr=59, rfgain="3"):
                          "SDR; stop it and click again")
             STATE.update({"listening": False})
             return
-        set_stage(55, "demodulating FM")
+        set_stage(55, "demodulating FM (stereo v2)")
         wav = LAB / "radio_live.wav"
         try:
             wav.unlink()
         except OSError:
             pass
-        AUDIO_FS = int(FS_CAP / 2 / 16)     # 1.488M/16 = 93,023 Hz
         fh = open(wav, "wb")
-        # WAV header with a huge declared size (grows like nrsc5's)
-        fh.write(b"RIFF" + struct.pack("<I", 0x7FFFFFF0) + b"WAVE"
-                 + b"fmt " + struct.pack("<IHHIIHH", 16, 1, 1,
-                                         AUDIO_FS, AUDIO_FS * 2, 2, 16)
-                 + b"data" + struct.pack("<I", 0x7FFFFF00))
+        fh.write(fm_stereo.wav_header(fm_stereo.FS_AUDIO, 2))
         fh.flush()
-        buf = np.empty(2 * 65536, np.int16)
-        prev = np.complex64(1 + 0j)
-        de = 0.0
-        agc = 60000.0                             # adaptive output gain
-        alpha = 1.0 / (1.0 + 75e-6 * AUDIO_FS)   # 75us de-emphasis pole
+        dem = fm_stereo.FMStereo()
         mpv = None
         t0 = time.time()
+        # reader thread does NOTHING but big-gulp reads (the starvation
+        # law); the demod runs at its leisure off a deep queue
+        iq_q = queue.Queue(maxsize=64)
+
+        def sdr_reader():
+            while GEN[0] == my_gen:
+                b = np.empty(2 * 262144, np.int16)
+                r = sdr.readStream(st, [b], 262144, timeoutUs=1000000)
+                if r.ret > 0:
+                    try:
+                        iq_q.put_nowait(b[:2 * r.ret])
+                    except queue.Full:
+                        pass
+        threading.Thread(target=sdr_reader, daemon=True).start()
         while GEN[0] == my_gen:
-            r = sdr.readStream(st, [buf], 65536, timeoutUs=500000)
-            if r.ret <= 0:
+            try:
+                chunk = iq_q.get(timeout=1.0)
+            except queue.Empty:
                 continue
-            n = r.ret
-            raw = decimate2(buf[:2 * n])          # -> 1.488 MS/s cs16
-            x = (raw[0::2].astype(np.float32)
-                 + 1j * raw[1::2].astype(np.float32))
-            if len(x) < 64:
-                continue
-            xd = np.empty(len(x) + 1, np.complex64)
-            xd[0] = prev
-            xd[1:] = x
-            prev = x[-1]
-            d = np.angle(xd[1:] * np.conj(xd[:-1]))   # FM discriminator
-            k = (len(d) // 16) * 16
-            a = d[:k].reshape(-1, 16).mean(axis=1)    # -> ~93 kHz audio
-            # one-pole de-emphasis
-            out = np.empty(len(a), np.float32)
-            acc = de
-            for i in range(len(a)):
-                acc += alpha * (a[i] - acc)
-                out[i] = acc
-            de = float(acc)
-            # slow AGC: ride any station to ~17% FS rms, never clip peaks
-            r_ = float(np.sqrt((out ** 2).mean())) + 1e-9
-            want = min(max(5500.0 / r_, 12000.0), 400000.0)
-            agc += 0.06 * (want - agc)
-            pcm = np.clip(out * agc, -32000, 32000).astype(np.int16)
-            fh.write(pcm.tobytes())
-            fh.flush()
+            pcm, tele = dem.feed(decimate2(chunk))
+            if len(pcm):
+                fh.write(pcm.tobytes())
+                fh.flush()
+            for k in FM_KEYS:
+                if k in tele:
+                    STATE[k] = tele[k]
             if mpv is None and time.time() - t0 > 2.5:
                 mpv = subprocess.Popen(
                     [MPV, str(wav), "--volume=100", "--keep-open=yes",
                      "--force-seekable=yes",
-                     f"--title=Radio Tuna â€” {name} (FM)"])
+                     f"--title=ALBACORE TUNA â€” {name} (FM)"])
                 LIVE_PROCS.append(mpv)
                 set_stage(100, "")
         fh.close()
@@ -585,129 +599,193 @@ def listen_fm(mhz, name, ifgr=59, rfgain="3"):
 
 # â”€â”€ the page â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 PAGE = """<!DOCTYPE html><html><head><meta charset="utf-8">
-<title>Radio Tuna ðŸŸðŸ“»</title><style>
-body{font-family:Georgia,'Times New Roman',serif;background:
-radial-gradient(ellipse at top,#3b2a1a,#1d130a 70%);color:#e8d5a3;
-margin:0;padding:18px;min-height:100vh}
-h1{font-size:26px;margin:0;letter-spacing:2px;color:#f4e3b2;
-text-shadow:0 0 12px rgba(244,196,110,.35)}
-.sub{color:#a8895c;font-size:12px;margin-bottom:14px;font-style:italic}
-#cabinet{max-width:980px;margin:0 auto;background:linear-gradient(
-#2b1d10,#241708);border:3px solid #58402a;border-radius:18px;
-box-shadow:0 10px 40px rgba(0,0,0,.6),inset 0 1px 0 #6b4f2f;padding:20px}
-#freq{font-family:'Courier New',monospace;font-size:52px;color:#ffb84d;
-text-align:center;text-shadow:0 0 18px rgba(255,170,60,.55);margin:6px 0}
-#nowplaying{text-align:center;min-height:44px;color:#f4e3b2}
+<title>ALBACORE TUNA RADIO</title><style>
+body{font-family:Consolas,'Lucida Console',monospace;color:#9fd4e0;
+margin:0;padding:18px;min-height:100vh;background:#030509;
+background-image:linear-gradient(rgba(0,229,255,.05) 1px,transparent 1px),
+linear-gradient(90deg,rgba(0,229,255,.05) 1px,transparent 1px);
+background-size:44px 44px}
+body::after{content:'';position:fixed;inset:0;pointer-events:none;
+background:repeating-linear-gradient(0deg,rgba(0,0,0,.14) 0 1px,
+transparent 1px 3px)}
+h1{font-size:24px;margin:0;letter-spacing:4px;color:#00e5ff;
+text-shadow:0 0 14px rgba(0,229,255,.8),0 0 40px rgba(0,229,255,.35)}
+h1 .mag{color:#ff2bd6;text-shadow:0 0 14px rgba(255,43,214,.8)}
+.sub{color:#3f6a78;font-size:11px;margin-bottom:14px;letter-spacing:2px}
+#cabinet{max-width:980px;margin:0 auto;background:rgba(6,11,20,.92);
+border:1px solid rgba(0,229,255,.35);border-radius:8px;
+box-shadow:0 0 24px rgba(0,229,255,.12),inset 0 0 60px rgba(0,0,0,.5);
+padding:20px}
+#freq{font-size:52px;color:#00e5ff;text-align:center;
+text-shadow:0 0 22px rgba(0,229,255,.75);margin:6px 0}
+#nowplaying{text-align:center;min-height:44px;color:#c8ecf4}
 #nowplaying .t{font-size:19px}
-#nowplaying .a{font-size:13px;color:#c8a86e;font-style:italic}
-#dial{position:relative;height:64px;background:linear-gradient(#191008,
-#100a05);border:2px solid #58402a;border-radius:10px;margin:14px 0}
+#nowplaying .a{font-size:13px;color:#ff2bd6}
+#dial{position:relative;height:64px;background:#02040a;
+border:1px solid rgba(0,229,255,.35);border-radius:6px;margin:14px 0}
 #dial canvas{width:100%;height:100%;display:block}
-.meters{display:flex;gap:14px;justify-content:center;margin:10px 0}
-.meter{background:#191008;border:2px solid #58402a;border-radius:10px;
-padding:6px 16px;text-align:center;min-width:90px}
-.meter .k{font-size:10px;color:#a8895c;letter-spacing:1px}
-.meter .v{font-family:'Courier New',monospace;font-size:20px;color:#ffb84d}
-button{cursor:pointer;font-family:Georgia,serif}
-.knob{background:linear-gradient(#6b4f2f,#4a3319);color:#f4e3b2;border:
-1px solid #8a6a40;border-radius:8px;padding:7px 18px;font-size:14px}
-.knob:hover{background:linear-gradient(#7d5d38,#58402a)}
+.meters{display:flex;gap:12px;justify-content:center;margin:10px 0;
+flex-wrap:wrap}
+.meter{background:#04070f;border:1px solid rgba(0,229,255,.3);
+border-radius:6px;padding:6px 14px;text-align:center;min-width:86px}
+.meter .k{font-size:10px;color:#3f6a78;letter-spacing:2px}
+.meter .v{font-size:20px;color:#00e5ff;text-shadow:0 0 10px
+rgba(0,229,255,.5)}
+button{cursor:pointer;font-family:Consolas,monospace}
+.knob{background:#04070f;color:#9fd4e0;border:1px solid #00e5ff;
+border-radius:4px;padding:7px 18px;font-size:13px;letter-spacing:1px}
+.knob:hover{box-shadow:0 0 14px rgba(0,229,255,.6);color:#fff}
+.knob.hot{border-color:#ff2bd6;color:#ff8fe8}
+.knob.hot:hover{box-shadow:0 0 14px rgba(255,43,214,.6)}
 table{width:100%;border-collapse:collapse;font-size:14px;margin-top:12px}
-td{padding:7px 8px;border-bottom:1px solid #3a2917;vertical-align:middle}
-.st{font-size:16px;color:#f4e3b2}
-.hd{display:inline-block;background:#8a6a40;color:#1d130a;font-weight:
-bold;font-size:10px;border-radius:4px;padding:1px 6px;margin-left:6px}
-.prog{background:#191008;color:#e8d5a3;border:1px solid #6b4f2f;
-border-radius:6px;padding:4px 12px;margin:2px;font-size:13px}
-.prog:hover{background:#3a2917;color:#ffb84d}
-.rssi{color:#a8895c;font-family:'Courier New',monospace;font-size:12px}
-#status{text-align:center;color:#c8a86e;font-size:13px;min-height:20px;
+td{padding:7px 8px;border-bottom:1px solid rgba(0,229,255,.12);
+vertical-align:middle}
+tr:hover td{background:rgba(0,229,255,.04)}
+.st{font-size:15px;color:#c8ecf4}
+.hd{display:inline-block;background:#ff2bd6;color:#05070d;font-weight:
+bold;font-size:10px;border-radius:3px;padding:1px 6px;margin-left:6px;
+box-shadow:0 0 8px rgba(255,43,214,.6)}
+.prog{background:#04070f;color:#9fd4e0;border:1px solid
+rgba(0,229,255,.45);border-radius:4px;padding:4px 12px;margin:2px;
+font-size:12px}
+.prog:hover{box-shadow:0 0 10px rgba(0,229,255,.55);color:#fff}
+.rssi{color:#3f6a78;font-size:12px}
+#status{text-align:center;color:#7ab8c8;font-size:13px;min-height:20px;
 margin-top:6px}
-#pbar{height:8px;background:#191008;border:1px solid #58402a;
-border-radius:5px;margin:6px 15%;overflow:hidden;display:none}
-#pbar div{height:100%;background:linear-gradient(90deg,#8a6a40,#ffb84d);
-transition:width .8s;border-radius:5px}
+#pbar{height:6px;background:#04070f;border:1px solid rgba(0,229,255,.3);
+border-radius:4px;margin:6px 15%;overflow:hidden;display:none}
+#pbar div{height:100%;background:linear-gradient(90deg,#00e5ff,#ff2bd6);
+transition:width .8s;box-shadow:0 0 8px rgba(0,229,255,.8)}
+#nerd{margin-top:14px;border:1px solid rgba(255,43,214,.35);
+border-radius:6px;background:#04070f}
+#nerd summary{cursor:pointer;padding:8px 12px;color:#ff2bd6;
+letter-spacing:3px;font-size:12px;text-shadow:0 0 10px
+rgba(255,43,214,.5)}
+#nerdgrid{display:grid;grid-template-columns:repeat(auto-fill,
+minmax(150px,1fr));gap:8px;padding:10px}
+.ncard{border:1px solid rgba(0,229,255,.25);border-radius:4px;
+padding:6px 10px;background:rgba(0,229,255,.03)}
+.ncard .k{font-size:9px;color:#3f6a78;letter-spacing:2px}
+.ncard .v{font-size:16px;color:#39ff8a;text-shadow:0 0 8px
+rgba(57,255,138,.4)}
+.nbar{height:5px;background:#02040a;border-radius:3px;margin-top:4px;
+overflow:hidden}
+.nbar div{height:100%;background:linear-gradient(90deg,#00e5ff,#39ff8a);
+transition:width .6s}
+#daylab{padding:6px 12px;color:#7ab8c8;font-size:11px;
+border-top:1px solid rgba(255,43,214,.2);white-space:nowrap;
+overflow:hidden;text-overflow:ellipsis}
 </style></head><body><div id="cabinet">
-<h1>RADIO TUNA <span style="font-size:15px">ðŸŸðŸ“» high definition receiver</span></h1>
-<div class="sub">adaptive decoding Â· vacuum tubes not included</div>
+<h1>ALBACORE <span class="mag">TUNA</span> RADIO
+<span style="font-size:13px">&#x1F41F;&#x26A1; high definition
+receiver</span></h1>
+<div class="sub">adaptive decoding // albacore core // the dials do not
+lie</div>
 <div style="margin:4px 0 10px">
- <button class="knob" style="background:linear-gradient(#8a6a40,#58402a)">FM Â· HD</button>
- <button class="knob" style="opacity:.45" title="campaign pending">AM â€” soon</button>
- <button class="knob" style="opacity:.45" title="campaign pending">SW â€” soon</button>
+ <button class="knob hot">FM &middot; HD</button>
+ <button class="knob" style="opacity:.4" title="campaign pending">AM
+ &mdash; soon</button>
+ <button class="knob" style="opacity:.4" title="campaign pending">SW
+ &mdash; soon</button>
 </div>
-<div id="freq">â€” Â· â€”</div>
+<div id="freq">&mdash; &middot; &mdash;</div>
 <div id="nowplaying"><span class="t">welcome</span><br>
 <span class="a">survey the band, then click a program</span></div>
 <div id="dial"><canvas id="dialc" width="1880" height="120"></canvas></div>
 <div class="meters">
- <div class="meter"><div class="k">MER LO</div><div class="v" id="mlo">â€”</div></div>
- <div class="meter"><div class="k">MER HI</div><div class="v" id="mhi">â€”</div></div>
- <div class="meter"><div class="k">BER</div><div class="v" id="ber">â€”</div></div>
- <div class="meter"><div class="k">LOCK</div><div class="v" id="lock">â€”</div></div>
- <div class="meter"><div class="k">AUDIO</div><div class="v" id="audio">â€”</div></div>
+ <div class="meter"><div class="k">MER LO</div><div class="v" id="mlo">&mdash;</div></div>
+ <div class="meter"><div class="k">MER HI</div><div class="v" id="mhi">&mdash;</div></div>
+ <div class="meter"><div class="k">BER</div><div class="v" id="ber">&mdash;</div></div>
+ <div class="meter"><div class="k">LOCK</div><div class="v" id="lock">&mdash;</div></div>
+ <div class="meter"><div class="k">AUDIO</div><div class="v" id="audio">&mdash;</div></div>
 </div>
 <div style="text-align:center">
- <button class="knob" onclick="survey()">ðŸ“¡ SURVEY THE BAND</button>
- <button class="knob" onclick="stopL()">â¹ STOP</button>
+ <button class="knob" onclick="survey()">&#x1F4E1; SURVEY THE BAND</button>
+ <button class="knob" onclick="stopL()">&#x23F9; STOP</button>
 </div>
 <div id="status"></div>
 <div id="pbar"><div style="width:0%"></div></div>
-<div id="guide">loading the guideâ€¦</div>
+<details id="nerd" open><summary>STATS FOR NERDS</summary>
+<div id="nerdgrid"></div>
+<div id="daylab"></div></details>
+<div id="guide">loading the guide&hellip;</div>
 </div><script>
 let stations=[];
 async function survey(){document.getElementById('status').textContent=
-'surveying â€” sweeps the band, probes each strong station for HD (~4 min)â€¦';
+'surveying: sweeps the band, probes each strong station for HD (~4 min)';
 await fetch('/api/survey',{method:'POST'})}
 async function stopL(){await fetch('/api/stop',{method:'POST'})}
 async function listenFM(mhz,name){
 document.getElementById('status').textContent='tuning '+mhz.toFixed(1)+
-' analog â€” audio in ~4 sâ€¦';
+' analog (stereo v2) - audio in ~4 s';
 await fetch('/api/listen_fm',{method:'POST',body:JSON.stringify({mhz,name})})}
 async function listen(mhz,prog,name){
 document.getElementById('status').textContent='tuning '+mhz.toFixed(1)+
-' program '+prog+' â€” audio in ~8-12 sâ€¦';
+' program '+prog+' - audio in ~8-12 s';
 await fetch('/api/listen',{method:'POST',body:JSON.stringify({mhz,prog,name})})}
 function drawDial(cur){
 const c=document.getElementById('dialc'),g=c.getContext('2d');
-g.fillStyle='#0e0903';g.fillRect(0,0,c.width,c.height);
+g.fillStyle='#02040a';g.fillRect(0,0,c.width,c.height);
 const x=m=>((m-87.5)/(108.3-87.5))*c.width;
-g.strokeStyle='#58402a';g.fillStyle='#a8895c';
-g.font='16px Courier New';
+g.strokeStyle='#113a4a';g.fillStyle='#4a8a9a';
+g.font='16px Consolas';
 for(let m=88;m<=108;m+=2){g.beginPath();
 g.moveTo(x(m),0);g.lineTo(x(m),22);g.stroke();
 g.fillText(m,x(m)-12,44)}
 for(const s of stations){const px=x(s.mhz);
-g.fillStyle=s.hd?'#ffb84d':'#6b4f2f';
-g.beginPath();g.arc(px,78,s.hd?7:4,0,7);g.fill()}
-if(cur){g.strokeStyle='#ff4d1c';g.lineWidth=3;g.beginPath();
-g.moveTo(x(cur),0);g.lineTo(x(cur),c.height);g.stroke();g.lineWidth=1}}
+g.fillStyle=s.hd?'#00e5ff':'#33566a';
+g.shadowColor=s.hd?'#00e5ff':'transparent';g.shadowBlur=s.hd?10:0;
+g.beginPath();g.arc(px,78,s.hd?7:4,0,7);g.fill();g.shadowBlur=0}
+if(cur){g.strokeStyle='#ff2bd6';g.lineWidth=3;g.shadowColor='#ff2bd6';
+g.shadowBlur=12;g.beginPath();
+g.moveTo(x(cur),0);g.lineTo(x(cur),c.height);g.stroke();
+g.lineWidth=1;g.shadowBlur=0}}
+function ncard(k,v,bar){return '<div class="ncard"><div class="k">'+k+
+'</div><div class="v">'+v+'</div>'+(bar!=null?
+'<div class="nbar"><div style="width:'+
+Math.max(0,Math.min(100,bar))+'%"></div></div>':'')+'</div>'}
 async function refresh(){try{
 const s=await (await fetch('/api/state')).json();
 stations=s.stations||[];
 document.getElementById('freq').textContent=
-s.mhz?s.mhz.toFixed(1)+' FM':'â€” Â· â€”';
+s.mhz?s.mhz.toFixed(1)+' FM':'\\u2014 \\u00b7 \\u2014';
 if(s.listening){document.getElementById('nowplaying').innerHTML=
 '<span class="t">'+(s.title||s.name||'')+'</span><br><span class="a">'+
 (s.artist||'')+'</span>'}
-document.getElementById('mlo').textContent=s.mer_lo??'â€”';
-document.getElementById('mhi').textContent=s.mer_hi??'â€”';
-document.getElementById('ber').textContent=s.ber!=null?s.ber.toFixed(4):'â€”';
-document.getElementById('lock').textContent=s.sync?'â—':'â€”';
-document.getElementById('lock').style.color=s.sync?'#7dff8a':'#a8895c';
+document.getElementById('mlo').textContent=s.mer_lo??'\\u2014';
+document.getElementById('mhi').textContent=s.mer_hi??'\\u2014';
+document.getElementById('ber').textContent=s.ber!=null?s.ber.toFixed(4):'\\u2014';
+document.getElementById('lock').textContent=s.sync?'\\u25cf':'\\u2014';
+document.getElementById('lock').style.color=s.sync?'#39ff8a':'#3f6a78';
 const au=document.getElementById('audio');
-au.textContent=s.audio==='MUSIC/SPEECH'?'â™ª':(s.audio==='STATIC'?'âœ—':
-(s.audio==='SILENCE'?'â€¦':(s.audio||'â€”')));
-au.style.color=s.audio==='MUSIC/SPEECH'?'#7dff8a':
-(s.audio==='STATIC'?'#ff6b4d':'#a8895c');
+au.textContent=s.audio==='MUSIC/SPEECH'?'\\u266a':(s.audio==='STATIC'?'\\u2717':
+(s.audio==='SILENCE'?'\\u2026':(s.audio||'\\u2014')));
+au.style.color=s.audio==='MUSIC/SPEECH'?'#39ff8a':
+(s.audio==='STATIC'?'#ff3b3b':'#3f6a78');
 if(s.survey&&s.survey.running)document.getElementById('status').textContent=
-'ðŸ“¡ '+s.survey.line+' ('+s.survey.pct+'%)';
+'[SURVEY] '+s.survey.line+' ('+s.survey.pct+'%)';
 const pb=document.getElementById('pbar');
 if(s.stage&&s.pct<100){document.getElementById('status').textContent=
-(s.pct===0?'ðŸ”´ ':'ðŸŽ› ')+s.stage;
+(s.pct===0?'[!] ':'[~] ')+s.stage;
 pb.style.display='block';pb.firstElementChild.style.width=(s.pct||2)+'%';}
 else if(!s.survey||!s.survey.running){pb.style.display='none';
 if(s.listening&&s.pct===100)document.getElementById('status').textContent='';}
 drawDial(s.mhz);
+let ng=ncard('DECODER',s.decoder||'idle');
+if(s.pilot_snr_db!=null){
+ng+=ncard('19K PILOT SNR',s.pilot_snr_db+' dB',s.pilot_snr_db/40*100);
+ng+=ncard('AUDIO SNR',s.audio_snr_db+' dB',s.audio_snr_db/50*100);
+ng+=ncard('STEREO BLEND',Math.round((s.stereo_blend||0)*100)+'% '+
+(s.fm_mode||''),(s.stereo_blend||0)*100);
+ng+=ncard('AGC',(s.agc_db>0?'+':'')+s.agc_db+' dB');}
+if(s.mer_lo!=null)ng+=ncard('MER LO/HI',s.mer_lo+' / '+(s.mer_hi??'?')+
+' dB',s.mer_lo/16*100);
+if(s.ber!=null)ng+=ncard('BER',s.ber.toFixed(4),
+100-Math.min(100,s.ber*2000));
+if(s.audio)ng+=ncard('AUDIO VERDICT',s.audio);
+document.getElementById('nerdgrid').innerHTML=ng;
+document.getElementById('daylab').textContent=
+s.daylab?('DAY LAB \\u25b8 '+s.daylab):'DAY LAB \\u25b8 idle';
 let h='<table>';
 for(const st of stations){
 h+='<tr><td class="st">'+st.mhz.toFixed(1)+
@@ -717,15 +795,32 @@ if(st.hd){const progs=Object.keys(st.programs||{}).length?
 Object.entries(st.programs):[["0","HD1"]];
 for(const [p,label] of progs){h+='<button class="prog" onclick="listen('+
 st.mhz+','+p+',\\''+(st.name||st.mhz)+'\\')">HD'+(parseInt(p)+1)+
-' <span style="color:#a8895c;font-size:10px">'+label+'</span></button>'}}
-h+='<button class="prog" style="border-color:#4a6a40" onclick="listenFM('+
+' <span style="color:#3f6a78;font-size:10px">'+label+'</span></button>'}}
+h+='<button class="prog" style="border-color:#39ff8a" onclick="listenFM('+
 st.mhz+',\\''+(st.name||st.mhz)+'\\')">FM</button>';
 h+='</td><td class="rssi">+'+st.rssi+' dB'+
-(st.mer_lo!=null?' Â· MER '+st.mer_lo:'')+'</td></tr>'}
+(st.mer_lo!=null?' | MER '+st.mer_lo:'')+'</td></tr>'}
 document.getElementById('guide').innerHTML=h+'</table>';
 }catch(e){}}
 setInterval(refresh,1500);refresh();
 </script></body></html>"""
+
+
+_DAYLAB = {"t": 0.0, "line": ""}
+
+
+def daylab_line():
+    """Last line of the all-day lab's log (cached 5 s) so the nerd tab
+    shows what the background science is doing right now."""
+    now = time.time()
+    if now - _DAYLAB["t"] > 5:
+        try:
+            txt = Path(r"Z:\SDR_Agent_v2\hd_day_lab_log.txt").read_text()
+            _DAYLAB["line"] = txt.strip().splitlines()[-1]
+        except Exception:
+            _DAYLAB["line"] = ""
+        _DAYLAB["t"] = now
+    return _DAYLAB["line"]
 
 
 class H(BaseHTTPRequestHandler):
@@ -746,6 +841,7 @@ class H(BaseHTTPRequestHandler):
         elif self.path == "/api/state":
             st = dict(STATE)
             st["survey"] = dict(SURVEY)
+            st["daylab"] = daylab_line()
             try:
                 st["stations"] = json.loads(
                     STATIONS.read_text(encoding="utf-8"))["stations"]

@@ -62,10 +62,27 @@ def open_sdr(mhz, ifgr=40.0, rfgain="3"):
     import SoapySDR
     from SoapySDR import SOAPY_SDR_RX, SOAPY_SDR_CS16
     SoapySDR.SoapySDR_setLogLevel(SoapySDR.SOAPY_SDR_FATAL)
+    # antenna auto-cal (hd_ant_cal.json, written by hd_ant_autotune.py):
+    # per-(antenna, station) gain knees so tools adapt to whatever antenna
+    # is plugged in. Env overrides (HD_IFGR/HD_RFGAIN) always win.
+    ant = _os.environ.get("HD_ANT", "Antenna A")
+    cal_path = LAB / "hd_ant_cal.json"
+    if cal_path.exists() and "HD_IFGR" not in _os.environ:
+        try:
+            import json as _json
+            acal = _json.loads(cal_path.read_text()).get(ant, {})
+            ent = acal.get(f"{mhz:.1f}") or acal.get("_default")
+            if ent:
+                ifgr = ent["ifgr"]
+                rfgain = str(ent["rfgain"])
+        except Exception:
+            pass
+    ifgr = float(_os.environ.get("HD_IFGR", ifgr))
+    rfgain = _os.environ.get("HD_RFGAIN", rfgain)
     sdr = SoapySDR.Device("driver=sdrplay")
     sdr.setSampleRate(SOAPY_SDR_RX, 0, FS_CAP)
     sdr.setFrequency(SOAPY_SDR_RX, 0, mhz * 1e6)
-    sdr.setAntenna(SOAPY_SDR_RX, 0, "Antenna A")
+    sdr.setAntenna(SOAPY_SDR_RX, 0, ant)
     try:
         sdr.setGainMode(SOAPY_SDR_RX, 0, False)
     except Exception:
@@ -90,7 +107,8 @@ def decimate2_cs16(raw):
     """interleaved int16 IQ at 2x -> halfband-ish decimated cs16 at 1x.
     Simple 2-tap average before decimation — adequate anti-alias for a
     signal occupying ~400 kHz of a 1.49 MHz output rate."""
-    i = raw[0::2].astype(np.int32)
+    raw = raw[: (len(raw) // 4) * 4]   # guard: retry-shortened captures can
+    i = raw[0::2].astype(np.int32)     # land odd sample counts
     q = raw[1::2].astype(np.int32)
     i2 = ((i[0::2] + i[1::2]) // 2).astype(np.int16)
     q2 = ((q[0::2] + q[1::2]) // 2).astype(np.int16)
