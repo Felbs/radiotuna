@@ -154,6 +154,13 @@ def pick_antenna(mhz, mode):
 
 def open_sdr(mhz, ifgr=59.0, rfgain="3", rate=FS_CAP, ant="Antenna A"):
     _ensure_sdr_dll_path()
+    import radio_lock
+    if not radio_lock.acquire("panel", f"listen {mhz:.1f}", 80,
+                              wait_s=6.0):
+        holder = radio_lock.status() or {}
+        raise RuntimeError(
+            f"radio held by {holder.get('owner', '?')} "
+            f"({holder.get('purpose', '?')})")
     import SoapySDR
     from SoapySDR import SOAPY_SDR_RX, SOAPY_SDR_CS16
     SoapySDR.SoapySDR_setLogLevel(SoapySDR.SOAPY_SDR_FATAL)
@@ -213,6 +220,11 @@ def close_sdr(sdr, st):
     try:
         sdr.deactivateStream(st)
         sdr.closeStream(st)
+    except Exception:
+        pass
+    try:
+        import radio_lock
+        radio_lock.release("panel")
     except Exception:
         pass
 
