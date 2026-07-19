@@ -18,6 +18,13 @@ reception as take-it-or-leave-it. **Adaptive decoding closes the loop**:
    loop, not the settings
 4. Demand liveness proof — a metric without decoded content is a mirage
 
+**Deep dive: [docs/SCIENCE.md](docs/SCIENCE.md)** — the physics, math,
+and logic behind every mechanism in the code: the FM noise parabola and
+why the hiss lived above 15 kHz, Carson's rule and the neighbor-station
+trap, pilot-doubling stereo (and the 90° convention bug measurement
+caught), honest meter design (probe skirts, noise bandwidth), the
+anti-regression discipline, and the three-antenna experiment design.
+
 ## Quickstart
 ```bash
 git clone https://github.com/Felbs/gr-radiotuna.git
