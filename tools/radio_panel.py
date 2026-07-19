@@ -132,14 +132,21 @@ def pick_antenna(mhz, mode):
     """The perfect-tune table (fitted from the 3-antenna day-lab cube,
     2026-07-19): per-station winning antenna for 'hd' or 'fm'. The
     antennas are complementary — no single one covers the band (88.5 +
-    103.5 only decode on the TV yagi; 93.3 only on rabbit ears)."""
+    103.5 only decode on the TV yagi; 93.3 only on rabbit ears) — AND
+    the winner map is hour-dependent (the yagi owned midday, the
+    discone swept the evening), so consult the hour band first."""
     try:
         t = json.loads((LAB / "radio_tune_table.json").read_text())
-        ent = t["stations"].get(f"{mhz:.1f}", {})
-        ant = ent.get(f"{mode}_ant") or ent.get("hd_ant") \
-            or ent.get("fm_ant")
-        if ant:
-            return ant
+        h = time.gmtime().tm_hour
+        band = "day" if 11 <= h < 19 else "evening"
+        key = f"{mhz:.1f}"
+        for tbl in (t.get("by_hour", {}).get(band, {}).get("stations", {}),
+                    t["stations"]):
+            ent = tbl.get(key, {})
+            ant = ent.get(f"{mode}_ant") or ent.get("hd_ant") \
+                or ent.get("fm_ant")
+            if ant:
+                return ant
     except Exception:
         pass
     return "Antenna A"
