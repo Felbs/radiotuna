@@ -1,14 +1,14 @@
-"""radio_panel.py — Radio Tuna's listening room.  http://localhost:8643
+﻿"""radio_panel.py â€” Radio Tuna's listening room.  http://localhost:8643
 
 A classic receiver, rendered: big frequency readout, a tuning dial with
 every station the band survey found, HD subchannel buttons (the "grid"),
 live now-playing metadata scraped from the digital stream, and MER/BER
 meters. TV Tuna panel skeleton in a vintage cabinet.
 
-  SURVEY — two stages: wideband FFT sweep finds carriers (~10 s), then
+  SURVEY â€” two stages: wideband FFT sweep finds carriers (~10 s), then
            nrsc5 probes the strong ones for HD (name, slogan, programs).
            Results cached to lab/stations.json (the radio guide).
-  LISTEN — click a subchannel: SDR pump -> nrsc5 -> growing WAV -> mpv,
+  LISTEN â€” click a subchannel: SDR pump -> nrsc5 -> growing WAV -> mpv,
            stats and metadata streaming to the panel.
 """
 import json
@@ -193,7 +193,7 @@ def stop_listen():
                    capture_output=True)
 
 
-# ── band survey ────────────────────────────────────────────────────
+# â”€â”€ band survey â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 def fm_power_sweep():
     """Wideband FFT hops across 88-108; returns {mhz: rssi_db} at the
     odd-tenth US channel frequencies."""
@@ -309,19 +309,19 @@ def run_survey():
     if SURVEY["running"]:
         return
     SURVEY.update({"running": True, "pct": 2,
-                   "line": "sweeping the band…"})
+                   "line": "sweeping the bandâ€¦"})
     try:
         stop_listen()
         time.sleep(1)
         carriers = fm_power_sweep()
         strong = {f: v for f, v in carriers.items() if v >= 14}
         SURVEY.update({"pct": 15,
-                       "line": f"{len(strong)} strong stations — "
-                               "probing for HD…"})
+                       "line": f"{len(strong)} strong stations â€” "
+                               "probing for HDâ€¦"})
         stations = []
         done = 0
         for mhz, rssi in sorted(strong.items()):
-            SURVEY["line"] = f"probing {mhz:.1f} MHz…"
+            SURVEY["line"] = f"probing {mhz:.1f} MHzâ€¦"
             info = hd_probe(mhz)
             done += 1
             SURVEY["pct"] = 15 + int(80 * done / max(1, len(strong)))
@@ -343,7 +343,7 @@ def run_survey():
         SURVEY["running"] = False
 
 
-# ── listening ──────────────────────────────────────────────────────
+# â”€â”€ listening â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 def _cal_gains(mhz, ifgr, rfgain):
     """Learned per-station gains (hd_quality.py sweeps) beat the one-size
     default - at the HD cliff the measured optimum is the difference
@@ -369,7 +369,7 @@ def listen(mhz, prog, name, ifgr=59, rfgain="3"):
                       "listening": True, "sync": False,
                       "title": None, "artist": None})
 
-    set_stage(8, "warming the tubes — opening the radio")
+    set_stage(8, "warming the tubes â€” opening the radio")
 
     def worker():
         sdr = st = None
@@ -380,14 +380,14 @@ def listen(mhz, prog, name, ifgr=59, rfgain="3"):
             except Exception:
                 if GEN[0] != my_gen:
                     return
-                set_stage(8, f"radio busy — retrying ({attempt + 2}/4)")
+                set_stage(8, f"radio busy â€” retrying ({attempt + 2}/4)")
                 time.sleep(2.5)
         if sdr is None:
-            set_stage(0, "RADIO UNAVAILABLE — another process holds the "
+            set_stage(0, "RADIO UNAVAILABLE â€” another process holds the "
                          "SDR; stop it and click again")
             STATE.update({"listening": False})
             return
-        set_stage(30, "receiving — streaming into the HD decoder")
+        set_stage(30, "receiving â€” streaming into the HD decoder")
         wav = LAB / "radio_live.wav"
         try:
             wav.unlink()
@@ -395,7 +395,7 @@ def listen(mhz, prog, name, ifgr=59, rfgain="3"):
             pass
         buf = np.empty(2 * 65536, np.int16)
         # STREAMING (2026-07-05): nrsc5 -r - reads IQ from stdin, so the
-        # radio pumps straight into the decoder — no growing-file EOF
+        # radio pumps straight into the decoder â€” no growing-file EOF
         # stall (this build stops at EOF instead of tailing).
         nr = subprocess.Popen(
             [NRSC5, "-r", "-", "-o", str(wav), str(prog)],
@@ -420,7 +420,7 @@ def listen(mhz, prog, name, ifgr=59, rfgain="3"):
         nr_t0 = time.time()
         mpv = None
         # LOSSLESS PUMP (2026-07-05): the SDR loop must NEVER block on the
-        # decoder's pipe — backpressure was stalling reads, dropping
+        # decoder's pipe â€” backpressure was stalling reads, dropping
         # samples, and turning clean BER into static audio. Reader only
         # reads; a writer thread absorbs pipe stalls via a deep queue.
         q = queue.Queue(maxsize=256)
@@ -439,8 +439,8 @@ def listen(mhz, prog, name, ifgr=59, rfgain="3"):
         threading.Thread(target=feeder, daemon=True).start()
 
         def on_static():
-            set_stage(30, "audio probe says STATIC — HD stream is lying; "
-                          "switching to analog FM…")
+            set_stage(30, "audio probe says STATIC â€” HD stream is lying; "
+                          "switching to analog FMâ€¦")
             threading.Thread(target=listen_fm, args=(mhz, name),
                              daemon=True).start()
         threading.Thread(target=audio_watch,
@@ -455,12 +455,12 @@ def listen(mhz, prog, name, ifgr=59, rfgain="3"):
                 except queue.Full:
                     pass                     # decoder hopeless behind; skip
             if STATE.get("sync") and STATE["pct"] < 70:
-                set_stage(70, "SYNC — decoding digital audio")
+                set_stage(70, "SYNC â€” decoding digital audio")
             # honesty + rescue: no sync in 25 s = this station's HD is out
-            # of reach here — fall back to analog so a click ends in sound
+            # of reach here â€” fall back to analog so a click ends in sound
             if not STATE.get("sync") and time.time() - nr_t0 > 25:
-                set_stage(30, "no HD sync — digital too weak here; "
-                              "switching to analog FM…")
+                set_stage(30, "no HD sync â€” digital too weak here; "
+                              "switching to analog FMâ€¦")
                 close_sdr(sdr, st)
                 try:
                     nr.terminate()
@@ -472,9 +472,9 @@ def listen(mhz, prog, name, ifgr=59, rfgain="3"):
             if mpv is None and wav.exists() and wav.stat().st_size > 400_000:
                 set_stage(88, "buffering audio")
                 mpv = subprocess.Popen(
-                    [MPV, str(wav), "--volume=115", "--keep-open=yes",
+                    [MPV, str(wav), "--volume=100", "--keep-open=yes",
                      "--force-seekable=yes",
-                     f"--title=Radio Tuna — {name}"])
+                     f"--title=Radio Tuna â€” {name}"])
                 LIVE_PROCS.append(mpv)
                 set_stage(100, "")
         try:
@@ -497,7 +497,7 @@ def listen_fm(mhz, name, ifgr=59, rfgain="3"):
         my_gen = GEN[0]
         STATE.update({"mhz": mhz, "prog": None, "name": name + " (analog)",
                       "listening": True, "sync": False,
-                      "title": name, "artist": "analog FM — mono v1",
+                      "title": name, "artist": "analog FM â€” mono v1",
                       "mer_lo": None, "mer_hi": None, "ber": None})
     set_stage(15, "opening the radio (analog FM)")
 
@@ -511,10 +511,10 @@ def listen_fm(mhz, name, ifgr=59, rfgain="3"):
             except Exception:
                 if GEN[0] != my_gen:
                     return
-                set_stage(15, f"radio busy — retrying ({attempt + 2}/4)")
+                set_stage(15, f"radio busy â€” retrying ({attempt + 2}/4)")
                 time.sleep(2.5)
         if sdr is None:
-            set_stage(0, "RADIO UNAVAILABLE — another process holds the "
+            set_stage(0, "RADIO UNAVAILABLE â€” another process holds the "
                          "SDR; stop it and click again")
             STATE.update({"listening": False})
             return
@@ -572,9 +572,9 @@ def listen_fm(mhz, name, ifgr=59, rfgain="3"):
             fh.flush()
             if mpv is None and time.time() - t0 > 2.5:
                 mpv = subprocess.Popen(
-                    [MPV, str(wav), "--volume=110", "--keep-open=yes",
+                    [MPV, str(wav), "--volume=100", "--keep-open=yes",
                      "--force-seekable=yes",
-                     f"--title=Radio Tuna — {name} (FM)"])
+                     f"--title=Radio Tuna â€” {name} (FM)"])
                 LIVE_PROCS.append(mpv)
                 set_stage(100, "")
         fh.close()
@@ -583,9 +583,9 @@ def listen_fm(mhz, name, ifgr=59, rfgain="3"):
     threading.Thread(target=worker, daemon=True).start()
 
 
-# ── the page ───────────────────────────────────────────────────────
+# â”€â”€ the page â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 PAGE = """<!DOCTYPE html><html><head><meta charset="utf-8">
-<title>Radio Tuna 🐟📻</title><style>
+<title>Radio Tuna ðŸŸðŸ“»</title><style>
 body{font-family:Georgia,'Times New Roman',serif;background:
 radial-gradient(ellipse at top,#3b2a1a,#1d130a 70%);color:#e8d5a3;
 margin:0;padding:18px;min-height:100vh}
@@ -628,44 +628,44 @@ border-radius:5px;margin:6px 15%;overflow:hidden;display:none}
 #pbar div{height:100%;background:linear-gradient(90deg,#8a6a40,#ffb84d);
 transition:width .8s;border-radius:5px}
 </style></head><body><div id="cabinet">
-<h1>RADIO TUNA <span style="font-size:15px">🐟📻 high definition receiver</span></h1>
-<div class="sub">adaptive decoding · vacuum tubes not included</div>
+<h1>RADIO TUNA <span style="font-size:15px">ðŸŸðŸ“» high definition receiver</span></h1>
+<div class="sub">adaptive decoding Â· vacuum tubes not included</div>
 <div style="margin:4px 0 10px">
- <button class="knob" style="background:linear-gradient(#8a6a40,#58402a)">FM · HD</button>
- <button class="knob" style="opacity:.45" title="campaign pending">AM — soon</button>
- <button class="knob" style="opacity:.45" title="campaign pending">SW — soon</button>
+ <button class="knob" style="background:linear-gradient(#8a6a40,#58402a)">FM Â· HD</button>
+ <button class="knob" style="opacity:.45" title="campaign pending">AM â€” soon</button>
+ <button class="knob" style="opacity:.45" title="campaign pending">SW â€” soon</button>
 </div>
-<div id="freq">— · —</div>
+<div id="freq">â€” Â· â€”</div>
 <div id="nowplaying"><span class="t">welcome</span><br>
 <span class="a">survey the band, then click a program</span></div>
 <div id="dial"><canvas id="dialc" width="1880" height="120"></canvas></div>
 <div class="meters">
- <div class="meter"><div class="k">MER LO</div><div class="v" id="mlo">—</div></div>
- <div class="meter"><div class="k">MER HI</div><div class="v" id="mhi">—</div></div>
- <div class="meter"><div class="k">BER</div><div class="v" id="ber">—</div></div>
- <div class="meter"><div class="k">LOCK</div><div class="v" id="lock">—</div></div>
- <div class="meter"><div class="k">AUDIO</div><div class="v" id="audio">—</div></div>
+ <div class="meter"><div class="k">MER LO</div><div class="v" id="mlo">â€”</div></div>
+ <div class="meter"><div class="k">MER HI</div><div class="v" id="mhi">â€”</div></div>
+ <div class="meter"><div class="k">BER</div><div class="v" id="ber">â€”</div></div>
+ <div class="meter"><div class="k">LOCK</div><div class="v" id="lock">â€”</div></div>
+ <div class="meter"><div class="k">AUDIO</div><div class="v" id="audio">â€”</div></div>
 </div>
 <div style="text-align:center">
- <button class="knob" onclick="survey()">📡 SURVEY THE BAND</button>
- <button class="knob" onclick="stopL()">⏹ STOP</button>
+ <button class="knob" onclick="survey()">ðŸ“¡ SURVEY THE BAND</button>
+ <button class="knob" onclick="stopL()">â¹ STOP</button>
 </div>
 <div id="status"></div>
 <div id="pbar"><div style="width:0%"></div></div>
-<div id="guide">loading the guide…</div>
+<div id="guide">loading the guideâ€¦</div>
 </div><script>
 let stations=[];
 async function survey(){document.getElementById('status').textContent=
-'surveying — sweeps the band, probes each strong station for HD (~4 min)…';
+'surveying â€” sweeps the band, probes each strong station for HD (~4 min)â€¦';
 await fetch('/api/survey',{method:'POST'})}
 async function stopL(){await fetch('/api/stop',{method:'POST'})}
 async function listenFM(mhz,name){
 document.getElementById('status').textContent='tuning '+mhz.toFixed(1)+
-' analog — audio in ~4 s…';
+' analog â€” audio in ~4 sâ€¦';
 await fetch('/api/listen_fm',{method:'POST',body:JSON.stringify({mhz,name})})}
 async function listen(mhz,prog,name){
 document.getElementById('status').textContent='tuning '+mhz.toFixed(1)+
-' program '+prog+' — audio in ~8-12 s…';
+' program '+prog+' â€” audio in ~8-12 sâ€¦';
 await fetch('/api/listen',{method:'POST',body:JSON.stringify({mhz,prog,name})})}
 function drawDial(cur){
 const c=document.getElementById('dialc'),g=c.getContext('2d');
@@ -685,25 +685,25 @@ async function refresh(){try{
 const s=await (await fetch('/api/state')).json();
 stations=s.stations||[];
 document.getElementById('freq').textContent=
-s.mhz?s.mhz.toFixed(1)+' FM':'— · —';
+s.mhz?s.mhz.toFixed(1)+' FM':'â€” Â· â€”';
 if(s.listening){document.getElementById('nowplaying').innerHTML=
 '<span class="t">'+(s.title||s.name||'')+'</span><br><span class="a">'+
 (s.artist||'')+'</span>'}
-document.getElementById('mlo').textContent=s.mer_lo??'—';
-document.getElementById('mhi').textContent=s.mer_hi??'—';
-document.getElementById('ber').textContent=s.ber!=null?s.ber.toFixed(4):'—';
-document.getElementById('lock').textContent=s.sync?'●':'—';
+document.getElementById('mlo').textContent=s.mer_lo??'â€”';
+document.getElementById('mhi').textContent=s.mer_hi??'â€”';
+document.getElementById('ber').textContent=s.ber!=null?s.ber.toFixed(4):'â€”';
+document.getElementById('lock').textContent=s.sync?'â—':'â€”';
 document.getElementById('lock').style.color=s.sync?'#7dff8a':'#a8895c';
 const au=document.getElementById('audio');
-au.textContent=s.audio==='MUSIC/SPEECH'?'♪':(s.audio==='STATIC'?'✗':
-(s.audio==='SILENCE'?'…':(s.audio||'—')));
+au.textContent=s.audio==='MUSIC/SPEECH'?'â™ª':(s.audio==='STATIC'?'âœ—':
+(s.audio==='SILENCE'?'â€¦':(s.audio||'â€”')));
 au.style.color=s.audio==='MUSIC/SPEECH'?'#7dff8a':
 (s.audio==='STATIC'?'#ff6b4d':'#a8895c');
 if(s.survey&&s.survey.running)document.getElementById('status').textContent=
-'📡 '+s.survey.line+' ('+s.survey.pct+'%)';
+'ðŸ“¡ '+s.survey.line+' ('+s.survey.pct+'%)';
 const pb=document.getElementById('pbar');
 if(s.stage&&s.pct<100){document.getElementById('status').textContent=
-(s.pct===0?'🔴 ':'🎛 ')+s.stage;
+(s.pct===0?'ðŸ”´ ':'ðŸŽ› ')+s.stage;
 pb.style.display='block';pb.firstElementChild.style.width=(s.pct||2)+'%';}
 else if(!s.survey||!s.survey.running){pb.style.display='none';
 if(s.listening&&s.pct===100)document.getElementById('status').textContent='';}
@@ -721,7 +721,7 @@ st.mhz+','+p+',\\''+(st.name||st.mhz)+'\\')">HD'+(parseInt(p)+1)+
 h+='<button class="prog" style="border-color:#4a6a40" onclick="listenFM('+
 st.mhz+',\\''+(st.name||st.mhz)+'\\')">FM</button>';
 h+='</td><td class="rssi">+'+st.rssi+' dB'+
-(st.mer_lo!=null?' · MER '+st.mer_lo:'')+'</td></tr>'}
+(st.mer_lo!=null?' Â· MER '+st.mer_lo:'')+'</td></tr>'}
 document.getElementById('guide').innerHTML=h+'</table>';
 }catch(e){}}
 setInterval(refresh,1500);refresh();
