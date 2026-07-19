@@ -51,7 +51,9 @@ def _nrsc5_env():
     if "albacore" in NRSC5.lower():
         e["PATH"] = r"C:\msys64\mingw64\bin;" + e["PATH"]
         e.setdefault("ALBACORE", "1")
-        e.setdefault("ALBACORE_COSTAS_BW", "auto")
+        # COSTAS_BW=auto deliberately NOT set: the 7/19 field ledger had
+        # auto trail plain ALBACORE=1 in 3/3 cliff A/Bs (8v16, 0v1,
+        # 6v10 audio-s) — a regression by the no-regression law.
     return e
 MPV = (_os.environ.get("MPV_EXE") or _sh.which("mpv")
        or r"C:\Program Files\MPV Player\mpv.exe")
