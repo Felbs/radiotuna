@@ -68,7 +68,8 @@ STATE = {"mhz": None, "prog": None, "name": None, "listening": False,
          "audio": None,
          # stats-for-nerds: the knobs, live
          "decoder": None, "pilot_snr_db": None, "audio_snr_db": None,
-         "stereo_blend": None, "fm_mode": None, "agc_db": None}
+         "stereo_blend": None, "fm_mode": None, "agc_db": None,
+         "antenna": None}
 
 FM_KEYS = ("pilot_snr_db", "audio_snr_db", "stereo_blend", "fm_mode",
            "agc_db")
@@ -123,7 +124,28 @@ def _ensure_sdr_dll_path():
                 pass
 
 
-def open_sdr(mhz, ifgr=59.0, rfgain="3", rate=FS_CAP):
+ANT_NICK = {"Antenna A": "rabbit", "Antenna B": "old faithful",
+            "Antenna C": "discone"}
+
+
+def pick_antenna(mhz, mode):
+    """The perfect-tune table (fitted from the 3-antenna day-lab cube,
+    2026-07-19): per-station winning antenna for 'hd' or 'fm'. The
+    antennas are complementary — no single one covers the band (88.5 +
+    103.5 only decode on the TV yagi; 93.3 only on rabbit ears)."""
+    try:
+        t = json.loads((LAB / "radio_tune_table.json").read_text())
+        ent = t["stations"].get(f"{mhz:.1f}", {})
+        ant = ent.get(f"{mode}_ant") or ent.get("hd_ant") \
+            or ent.get("fm_ant")
+        if ant:
+            return ant
+    except Exception:
+        pass
+    return "Antenna A"
+
+
+def open_sdr(mhz, ifgr=59.0, rfgain="3", rate=FS_CAP, ant="Antenna A"):
     _ensure_sdr_dll_path()
     import SoapySDR
     from SoapySDR import SOAPY_SDR_RX, SOAPY_SDR_CS16
@@ -131,7 +153,7 @@ def open_sdr(mhz, ifgr=59.0, rfgain="3", rate=FS_CAP):
     sdr = SoapySDR.Device("driver=sdrplay")
     sdr.setSampleRate(SOAPY_SDR_RX, 0, rate)
     sdr.setFrequency(SOAPY_SDR_RX, 0, mhz * 1e6)
-    sdr.setAntenna(SOAPY_SDR_RX, 0, "Antenna A")
+    sdr.setAntenna(SOAPY_SDR_RX, 0, ant)
     try:
         sdr.setGainMode(SOAPY_SDR_RX, 0, False)
     except Exception:
@@ -163,7 +185,7 @@ def open_sdr(mhz, ifgr=59.0, rfgain="3", rate=FS_CAP):
             sdr = SoapySDR.Device("driver=sdrplay")
             sdr.setSampleRate(SOAPY_SDR_RX, 0, rate)
             sdr.setFrequency(SOAPY_SDR_RX, 0, mhz * 1e6)
-            sdr.setAntenna(SOAPY_SDR_RX, 0, "Antenna A")
+            sdr.setAntenna(SOAPY_SDR_RX, 0, ant)
             try:
                 sdr.setGainMode(SOAPY_SDR_RX, 0, False)
             except Exception:
@@ -208,7 +230,7 @@ def stop_listen():
         GEN[0] += 1
         STATE.update({"listening": False, "mhz": None, "prog": None,
                       "name": None, "sync": False, "stage": "", "pct": 0,
-                      "decoder": None})
+                      "decoder": None, "antenna": None})
         STATE.update({k: None for k in FM_KEYS})
     for p in LIVE_PROCS:
         try:
@@ -401,9 +423,12 @@ def listen(mhz, prog, name, ifgr=59, rfgain="3"):
 
     def worker():
         sdr = st = None
+        ant = pick_antenna(mhz, "hd")
+        STATE["antenna"] = ANT_NICK.get(ant, ant)
         for attempt in range(4):          # post-restart contention retry
             try:
-                sdr, st = open_sdr(mhz, ifgr=ifgr, rfgain=str(rfgain))
+                sdr, st = open_sdr(mhz, ifgr=ifgr, rfgain=str(rfgain),
+                                   ant=ant)
                 break
             except Exception:
                 if GEN[0] != my_gen:
@@ -534,9 +559,12 @@ def listen_fm(mhz, name, ifgr=59, rfgain="3"):
 
     def worker():
         sdr = st = None
+        ant = pick_antenna(mhz, "fm")
+        STATE["antenna"] = ANT_NICK.get(ant, ant)
         for attempt in range(4):
             try:
-                sdr, st = open_sdr(mhz, ifgr=ifgr, rfgain=str(rfgain))
+                sdr, st = open_sdr(mhz, ifgr=ifgr, rfgain=str(rfgain),
+                                   ant=ant)
                 break
             except Exception:
                 if GEN[0] != my_gen:
@@ -774,6 +802,7 @@ else if(!s.survey||!s.survey.running){pb.style.display='none';
 if(s.listening&&s.pct===100)document.getElementById('status').textContent='';}
 drawDial(s.mhz);
 let ng=ncard('DECODER',s.decoder||'idle');
+if(s.antenna)ng+=ncard('ANTENNA (auto)',s.antenna);
 if(s.pilot_snr_db!=null){
 ng+=ncard('19K PILOT SNR',s.pilot_snr_db+' dB',s.pilot_snr_db/40*100);
 ng+=ncard('AUDIO SNR',s.audio_snr_db+' dB',s.audio_snr_db/50*100);
