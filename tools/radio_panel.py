@@ -277,7 +277,11 @@ def fm_power_sweep():
     from SoapySDR import SOAPY_SDR_RX, SOAPY_SDR_CS16
     hops = [91.0, 97.0, 103.0]          # 8 MS/s each covers ~7 MHz well
     found = {}
-    for hop in hops:
+    for hi, hop in enumerate(hops):
+        SURVEY.update({"pct": 2 + int(12 * hi / len(hops)),
+                       "line": f"sweeping {hop - 3.4:.1f}-"
+                               f"{hop + 3.4:.1f} MHz for carriers "
+                               f"(hop {hi + 1}/{len(hops)})"})
         sdr, st = open_sdr(hop, ifgr=59, rfgain="3", rate=8_000_000)
         buf = np.empty(2 * 65536, np.int16)
         acc = None
@@ -396,10 +400,18 @@ def run_survey():
                                "probing for HDâ€¦"})
         stations = []
         done = 0
+        n_hd = 0
         for mhz, rssi in sorted(strong.items()):
-            SURVEY["line"] = f"probing {mhz:.1f} MHzâ€¦"
+            SURVEY["line"] = (f"probing {mhz:.1f} MHz for HD "
+                              f"({done + 1}/{len(strong)}) - "
+                              f"{n_hd} HD found so far")
             info = hd_probe(mhz)
             done += 1
+            if info.get("hd"):
+                n_hd += 1
+                SURVEY["line"] = (f"{mhz:.1f}: "
+                                  f"{info.get('name') or 'HD station'} "
+                                  f"decoded ({done}/{len(strong)})")
             SURVEY["pct"] = 15 + int(80 * done / max(1, len(strong)))
             stations.append({"mhz": mhz, "rssi": rssi,
                              "hd": info.get("hd", False),
@@ -843,13 +855,16 @@ au.textContent=s.audio==='MUSIC/SPEECH'?'\\u266a':(s.audio==='STATIC'?'\\u2717':
 (s.audio==='SILENCE'?'\\u2026':(s.audio||'\\u2014')));
 au.style.color=s.audio==='MUSIC/SPEECH'?'#39ff8a':
 (s.audio==='STATIC'?'#ff3b3b':'#3f6a78');
-if(s.survey&&s.survey.running)document.getElementById('status').textContent=
-'[SURVEY] '+s.survey.line+' ('+s.survey.pct+'%)';
 const pb=document.getElementById('pbar');
-if(s.stage&&s.pct<100){document.getElementById('status').textContent=
+if(s.survey&&s.survey.running){
+document.getElementById('status').textContent=
+'[SCAN] '+s.survey.line+' ('+s.survey.pct+'%)';
+pb.style.display='block';
+pb.firstElementChild.style.width=(s.survey.pct||2)+'%';}
+else if(s.stage&&s.pct<100){document.getElementById('status').textContent=
 (s.pct===0?'[!] ':'[~] ')+s.stage;
 pb.style.display='block';pb.firstElementChild.style.width=(s.pct||2)+'%';}
-else if(!s.survey||!s.survey.running){pb.style.display='none';
+else{pb.style.display='none';
 if(s.listening&&s.pct===100)document.getElementById('status').textContent='';}
 drawDial(s.mhz);
 let ng=ncard('DECODER',s.decoder||'idle');
