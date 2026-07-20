@@ -960,8 +960,8 @@ class H(BaseHTTPRequestHandler):
             h = time.gmtime().tm_hour
             st["hour_band"] = "day" if 11 <= h < 19 else "evening"
             try:
-                import sonos_cast
-                st["cast"] = sonos_cast.status()
+                import cast_local
+                st["cast"] = cast_local.status()
             except Exception:
                 st["cast"] = None
             # per-station measured quality (the tune-table's evidence)
@@ -1016,20 +1016,36 @@ class H(BaseHTTPRequestHandler):
         elif self.path == "/api/stop":
             threading.Thread(target=stop_listen, daemon=True).start()
             try:
-                import sonos_cast
-                threading.Thread(target=sonos_cast.stop,
+                import cast_local
+                threading.Thread(target=cast_local.stop,
                                  daemon=True).start()
             except Exception:
                 pass
             self._send('"stopped"')
         elif self.path == "/api/cast":
             def do_cast():
-                import sonos_cast
+                import cast_local
                 if req.get("on"):
                     name = STATE.get("name") or "radio"
-                    sonos_cast.start(f"ALBACORE TUNA RADIO - {name}")
+                    st = cast_local.start(f"ALBACORE TUNA RADIO - {name}")
+                    if st.get("on"):
+                        # the house runs ~15 s behind the burst buffer;
+                        # two copies at an offset is an echo chamber —
+                        # the PC yields to the whole-house stream
+                        subprocess.run(["taskkill", "/F", "/IM",
+                                        "mpv.exe"], capture_output=True)
                 else:
-                    sonos_cast.stop()
+                    cast_local.stop()
+                    # bring local audio back if a station is playing
+                    wav = LAB / "radio_live.wav"
+                    if STATE.get("listening") and wav.exists():
+                        mpv = subprocess.Popen(
+                            [MPV, str(wav), "--volume=100",
+                             "--keep-open=yes", "--force-seekable=yes",
+                             "--start=100%",
+                             f"--title=ALBACORE TUNA - "
+                             f"{STATE.get('name') or ''}"])
+                        LIVE_PROCS.append(mpv)
             threading.Thread(target=do_cast, daemon=True).start()
             self._send('"casting"')
         else:
