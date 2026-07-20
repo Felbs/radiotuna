@@ -137,7 +137,7 @@ threading.Thread(target=_spec_worker, daemon=True).start()
 # radio priority of anything in the house (10 < warden 20 < labs 50 <
 # human 80 < pass 100): yields via should_yield() between hops, stands
 # off satellite pass windows, and stops the instant a listen starts.
-BAND = {"rows": _collections.deque(maxlen=45)}
+BAND = {"rows": _collections.deque(maxlen=45), "hold": False}
 BAND_LO, BAND_HI, BAND_BINS = 88.0e6, 108.0e6, 1000
 
 
@@ -148,7 +148,7 @@ def _band_sweeper():
     win = np.hanning(N).astype(np.float32)
     while True:
         time.sleep(1.0)
-        if STATE.get("listening"):
+        if STATE.get("listening") or BAND["hold"]:
             continue
         try:
             wst = json.loads(Path(
@@ -186,11 +186,12 @@ def _band_sweeper():
             st_ = sdr.setupStream(SOAPY_SDR_RX, SOAPY_SDR_CS16)
             sdr.activateStream(st_)
             buf = np.empty(2 * 65536, np.int16)
-            while not STATE.get("listening") \
+            while not STATE.get("listening") and not BAND["hold"] \
                     and not radio_lock.should_yield():
                 row = np.full(BAND_BINS, np.nan, np.float32)
                 for hop in hops:
-                    if STATE.get("listening") or radio_lock.should_yield():
+                    if STATE.get("listening") or BAND["hold"] \
+                            or radio_lock.should_yield():
                         break
                     sdr.setFrequency(SOAPY_SDR_RX, 0, hop)
                     for _ in range(5):                    # retune settle
@@ -448,6 +449,8 @@ def decimate2(raw):
 def stop_listen():
     with LOCK:
         GEN[0] += 1
+        if STATE.get("mhz"):
+            STATE["last_mhz"] = STATE["mhz"]   # sticky band cursor
         STATE.update({"listening": False, "mhz": None, "prog": None,
                       "name": None, "sync": False, "stage": "", "pct": 0,
                       "decoder": None, "antenna": None, "ifgr": None,
@@ -474,12 +477,24 @@ def fm_power_sweep():
     from SoapySDR import SOAPY_SDR_RX, SOAPY_SDR_CS16
     hops = [91.0, 97.0, 103.0]          # 8 MS/s each covers ~7 MHz well
     found = {}
+    band_row = np.full(BAND_BINS, np.nan, np.float32)
     for hi, hop in enumerate(hops):
         SURVEY.update({"pct": 2 + int(12 * hi / len(hops)),
+                       "cur_mhz": hop,
                        "line": f"sweeping {hop - 3.4:.1f}-"
                                f"{hop + 3.4:.1f} MHz for carriers "
                                f"(hop {hi + 1}/{len(hops)})"})
-        sdr, st = open_sdr(hop, ifgr=59, rfgain="3", rate=8_000_000)
+        # the idle band sweeper may take ~1 s to yield the device
+        sdr = st = None
+        for attempt in range(5):
+            try:
+                sdr, st = open_sdr(hop, ifgr=59, rfgain="3",
+                                   rate=8_000_000)
+                break
+            except Exception:
+                if attempt == 4:
+                    raise
+                time.sleep(2.0)
         buf = np.empty(2 * 65536, np.int16)
         acc = None
         N = 8192
@@ -497,6 +512,18 @@ def fm_power_sweep():
             continue
         fax = np.fft.fftshift(np.fft.fftfreq(N, 1 / 8e6)) / 1e6 + hop
         db = 10 * np.log10(acc + 1e-12)
+        # feed the idle waterfall so the display stays alive mid-scan
+        use = np.abs(fax - hop) < 3.4
+        bi = ((fax[use] * 1e6 - BAND_LO) / (BAND_HI - BAND_LO)
+              * BAND_BINS).astype(int)
+        ok = (bi >= 0) & (bi < BAND_BINS)
+        np.fmax.at(band_row, bi[ok], db[use][ok].astype(np.float32))
+        if np.isfinite(band_row).any():
+            fill = float(np.nanmin(band_row))
+            BAND["rows"].append(
+                {"t": round(time.time(), 3),
+                 "db": np.round(np.where(np.isfinite(band_row),
+                                         band_row, fill), 1).tolist()})
         floor = float(np.median(db))
         f0 = 88.1
         while f0 <= 107.9 + 1e-9:
@@ -607,9 +634,10 @@ def run_survey():
         return
     SURVEY.update({"running": True, "pct": 2,
                    "line": "sweeping the bandâ€¦"})
+    BAND["hold"] = True                  # bench the idle sweeper
     try:
         stop_listen()
-        time.sleep(1)
+        time.sleep(2.5)                  # let the sweeper finish its hop
         carriers = fm_power_sweep()
         strong = {f: v for f, v in carriers.items() if v >= 14}
         SURVEY.update({"pct": 15,
@@ -619,6 +647,7 @@ def run_survey():
         done = 0
         n_hd = 0
         for mhz, rssi in sorted(strong.items()):
+            SURVEY["cur_mhz"] = mhz
             SURVEY["line"] = (f"probing {mhz:.1f} MHz for HD "
                               f"({done + 1}/{len(strong)}) - "
                               f"{n_hd} HD found so far")
@@ -653,6 +682,8 @@ def run_survey():
         SURVEY["line"] = f"survey failed: {e}"
     finally:
         SURVEY["running"] = False
+        SURVEY["cur_mhz"] = None
+        BAND["hold"] = False
 
 
 # â”€â”€ listening â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
@@ -1245,30 +1276,19 @@ else if(v<.7){const u=(v-.35)/.35;r=17+u*0;g=40+u*189;b=153+u*102}
 else{const u=(v-.7)/.3;r=0+u*255;g=229-u*186;b=255-u*41}
 p.push([Math.min(255,r|0),Math.min(255,g|0),Math.min(255,b|0)])}
 return p})();
-function drawSpecRows(rows){
+// waterfall history lives in an offscreen buffer; overlays (channel
+// lines, scan cursor) are composited onto the visible canvas each
+// frame so a moving cursor never burns ghost trails into the history
+const wfBuf=document.createElement('canvas');
+wfBuf.width=688;wfBuf.height=150;
+let lastDb=null;
+function drawLineGraph(db){
 const line=document.getElementById('specline'),lg=line.getContext('2d');
-const wf=document.getElementById('wfall'),wg=wf.getContext('2d');
-for(const row of rows){const db=row.db,n=db.length;
-let lo=Infinity,hi=-Infinity;
-for(const v of db){if(v<lo)lo=v;if(v>hi)hi=v}
-specLo=specLo===null?lo:specLo*.95+lo*.05;
-specHi=specHi===null?hi:specHi*.95+hi*.05;
-const rng=Math.max(specHi-specLo,10);
-// waterfall: scroll down 1px, paint newest row on top
-wg.drawImage(wf,0,0,wf.width,wf.height-1,0,1,wf.width,wf.height-1);
-const img=wg.createImageData(wf.width,1);
-for(let x=0;x<wf.width;x++){const bin=Math.floor(x*n/wf.width);
-const v=Math.max(0,Math.min(1,(db[bin]-specLo)/rng));
-const c=wfPal[(v*255)|0];const o=x*4;
-img.data[o]=c[0];img.data[o+1]=c[1];img.data[o+2]=c[2];
-img.data[o+3]=255}
-wg.putImageData(img,0,0)}
-// line graph: newest row only, cyan glow, magenta center mark
-const db=rows[rows.length-1].db,n=db.length;
-const rng=Math.max(specHi-specLo,10);
+const n=db.length,rng=Math.max((specHi||0)-(specLo||0),10);
 lg.fillStyle='#02040a';lg.fillRect(0,0,line.width,line.height);
-lg.strokeStyle='rgba(255,43,214,.45)';lg.beginPath();
-lg.moveTo(line.width/2,0);lg.lineTo(line.width/2,line.height);lg.stroke();
+if(specMode!=='band'){lg.strokeStyle='rgba(255,43,214,.45)';
+lg.beginPath();lg.moveTo(line.width/2,0);
+lg.lineTo(line.width/2,line.height);lg.stroke()}
 lg.strokeStyle='#00e5ff';lg.shadowColor='#00e5ff';lg.shadowBlur=7;
 lg.beginPath();
 for(let x=0;x<line.width;x++){const bin=Math.floor(x*n/line.width);
@@ -1276,16 +1296,55 @@ const v=Math.max(0,Math.min(1,(db[bin]-specLo)/rng));
 const y=line.height-3-v*(line.height-8);
 if(x===0)lg.moveTo(x,y);else lg.lineTo(x,y)}
 lg.stroke();lg.shadowBlur=0}
-let specMode=null;
+function drawSpecRows(rows){
+const bg=wfBuf.getContext('2d');
+for(const row of rows){const db=row.db,n=db.length;
+let lo=Infinity,hi=-Infinity;
+for(const v of db){if(v<lo)lo=v;if(v>hi)hi=v}
+specLo=specLo===null?lo:specLo*.95+lo*.05;
+specHi=specHi===null?hi:specHi*.95+hi*.05;
+const rng=Math.max(specHi-specLo,10);
+bg.drawImage(wfBuf,0,0,wfBuf.width,wfBuf.height-1,
+0,1,wfBuf.width,wfBuf.height-1);
+const img=bg.createImageData(wfBuf.width,1);
+for(let x=0;x<wfBuf.width;x++){const bin=Math.floor(x*n/wfBuf.width);
+const v=Math.max(0,Math.min(1,(db[bin]-specLo)/rng));
+const c=wfPal[(v*255)|0];const o=x*4;
+img.data[o]=c[0];img.data[o+1]=c[1];img.data[o+2]=c[2];
+img.data[o+3]=255}
+bg.putImageData(img,0,0)}
+lastDb=rows[rows.length-1].db;
+drawLineGraph(lastDb)}
+function blitWf(){const wf=document.getElementById('wfall');
+wf.getContext('2d').drawImage(wfBuf,0,0)}
+let specMode=null,specCursor=null,specScanning=false;
 function bandX(mhz,w){return (mhz-88.0)/20.0*w}
+function drawWfOverlay(){
+// channel guide lines ON the waterfall: every station a faint
+// vertical line (cyan = HD), redrawn each poll so they ride on top
+// of the scrolling history; the cursor is the bright one
+const wf=document.getElementById('wfall'),wg=wf.getContext('2d');
+for(const s of stations){const x=bandX(s.mhz,wf.width);
+wg.strokeStyle=s.hd?'rgba(0,229,255,.28)':'rgba(90,140,160,.18)';
+wg.beginPath();wg.moveTo(x,0);wg.lineTo(x,wf.height);wg.stroke()}
+if(specCursor!=null){const x=bandX(specCursor,wf.width);
+wg.strokeStyle=specScanning?'rgba(255,43,214,.95)':'rgba(0,229,255,.8)';
+wg.lineWidth=2;wg.shadowColor=specScanning?'#ff2bd6':'#00e5ff';
+wg.shadowBlur=8;wg.beginPath();wg.moveTo(x,0);wg.lineTo(x,wf.height);
+wg.stroke();wg.lineWidth=1;wg.shadowBlur=0}}
 function drawBandMarks(lg,w,h){
 // channel ruler: a tick each MHz, label every 4; station marks from
 // the guide; HD stations get magenta sideband shading (the +-129 to
 // +-198 kHz shelves where ALL the subchannels HD1-HD3 actually live)
-lg.strokeStyle='#113a4a';lg.fillStyle='#4a8a9a';lg.font='10px Consolas';
+lg.strokeStyle='#2a5a6e';lg.fillStyle='#6fb0c2';lg.font='10px Consolas';
 for(let m=88;m<=108;m++){const x=bandX(m,w);lg.beginPath();
-lg.moveTo(x,0);lg.lineTo(x,m%4===0?12:6);lg.stroke();
+lg.moveTo(x,0);lg.lineTo(x,m%4===0?14:7);lg.stroke();
 if(m%4===0)lg.fillText(m,x+2,11)}
+if(specCursor!=null){const x=bandX(specCursor,w);
+lg.strokeStyle=specScanning?'#ff2bd6':'#00e5ff';lg.lineWidth=2;
+lg.shadowColor=specScanning?'#ff2bd6':'#00e5ff';lg.shadowBlur=8;
+lg.beginPath();lg.moveTo(x,0);lg.lineTo(x,h);lg.stroke();
+lg.lineWidth=1;lg.shadowBlur=0}
 for(const s of stations){const x=bandX(s.mhz,w);
 if(s.hd){const x1=bandX(s.mhz-0.198,w),x2=bandX(s.mhz-0.129,w),
 x3=bandX(s.mhz+0.129,w),x4=bandX(s.mhz+0.198,w);
@@ -1301,15 +1360,24 @@ const r=await(await fetch('/api/spectrum?since='+specT)).json();
 const rows=r.rows||[];
 const box=document.getElementById('specbox');
 if(r.mode!==specMode){specMode=r.mode;specT=0;specLo=specHi=null;
+lastDb=null;
 const wf=document.getElementById('wfall');
 wf.getContext('2d').clearRect(0,0,wf.width,wf.height);
+wfBuf.getContext('2d').clearRect(0,0,wfBuf.width,wfBuf.height);
 document.getElementById('speclabel').textContent=
 r.mode==='band'?'FULL FM BAND · 88–108 MHz · idle sweep':
 'LIVE SPECTRUM · ±250 kHz AROUND THE DIAL'}
+specCursor=r.cursor_mhz;specScanning=!!r.scanning;
 if(rows.length){specT=rows[rows.length-1].t;
-box.style.display='block';drawSpecRows(rows);
-if(r.mode==='band'){const line=document.getElementById('specline');
-drawBandMarks(line.getContext('2d'),line.width,line.height)}}
+box.style.display='block';drawSpecRows(rows)}
+if(box.style.display==='block'){
+if(r.mode==='band'){
+if(!rows.length&&lastDb)drawLineGraph(lastDb);
+blitWf();
+const line=document.getElementById('specline');
+drawBandMarks(line.getContext('2d'),line.width,line.height);
+drawWfOverlay()}
+else if(rows.length)blitWf()}
 }catch(e){}
 setTimeout(specPoll,350)}
 specPoll();
@@ -1564,12 +1632,16 @@ class H(BaseHTTPRequestHandler):
             listening = bool(STATE.get("listening"))
             src = SPEC["rows"] if listening else BAND["rows"]
             rows = [r for r in list(src) if r["t"] > since]
+            cursor = (SURVEY.get("cur_mhz") if SURVEY.get("running")
+                      else STATE.get("last_mhz"))
             self._send(json.dumps(
                 {"mode": "station" if listening else "band",
                  "mhz": STATE.get("mhz"),
                  "span_hz": 2 * SPEC_SPAN,
                  "lo_hz": BAND_LO, "hi_hz": BAND_HI,
                  "listening": listening,
+                 "scanning": bool(SURVEY.get("running")),
+                 "cursor_mhz": cursor,
                  "rows": rows[-30:]}))
         elif self.path == "/api/state":
             st = dict(STATE)
