@@ -164,7 +164,13 @@ def open_sdr(mhz, ifgr=59.0, rfgain="3", rate=FS_CAP, ant="Antenna A"):
     import SoapySDR
     from SoapySDR import SOAPY_SDR_RX, SOAPY_SDR_CS16
     SoapySDR.SoapySDR_setLogLevel(SoapySDR.SOAPY_SDR_FATAL)
-    sdr = SoapySDR.Device("driver=sdrplay")
+    try:
+        sdr = SoapySDR.Device("driver=sdrplay")
+    except Exception:
+        # release the reservation we just took or the failed open
+        # deadlocks every retry against OUR OWN lock (bit us 7/19)
+        radio_lock.release("panel")
+        raise
     sdr.setSampleRate(SOAPY_SDR_RX, 0, rate)
     sdr.setFrequency(SOAPY_SDR_RX, 0, mhz * 1e6)
     sdr.setAntenna(SOAPY_SDR_RX, 0, ant)
@@ -428,7 +434,11 @@ def _cal_gains(mhz, ifgr, rfgain):
     return ifgr, str(rfgain)
 
 
-def listen(mhz, prog, name, ifgr=59, rfgain="3"):
+ANT_PICK = {"auto": None, "a": "Antenna A", "b": "Antenna B",
+            "c": "Antenna C"}
+
+
+def listen(mhz, prog, name, ifgr=59, rfgain="3", antenna=None):
     ifgr, rfgain = _cal_gains(mhz, ifgr, rfgain)
     STATE["ifgr"], STATE["rfgain"] = ifgr, str(rfgain)
     stop_listen()
@@ -444,8 +454,9 @@ def listen(mhz, prog, name, ifgr=59, rfgain="3"):
 
     def worker():
         sdr = st = None
-        ant = pick_antenna(mhz, "hd")
-        STATE["antenna"] = ANT_NICK.get(ant, ant)
+        ant = antenna or pick_antenna(mhz, "hd")
+        STATE["antenna"] = ANT_NICK.get(ant, ant) \
+            + ("" if antenna is None else " [manual]")
         for attempt in range(4):          # post-restart contention retry
             try:
                 sdr, st = open_sdr(mhz, ifgr=ifgr, rfgain=str(rfgain),
@@ -561,7 +572,7 @@ def listen(mhz, prog, name, ifgr=59, rfgain="3"):
     threading.Thread(target=worker, daemon=True).start()
 
 
-def listen_fm(mhz, name, ifgr=59, rfgain="3"):
+def listen_fm(mhz, name, ifgr=59, rfgain="3", antenna=None):
     """Analog FM v2 (fm_stereo.py): channel-select FIR, pilot-locked
     stereo with SNR-adaptive mono blend, 15 kHz audio filtering, live
     truth dials. The v1 path shipped the whole unfiltered composite
@@ -581,8 +592,9 @@ def listen_fm(mhz, name, ifgr=59, rfgain="3"):
 
     def worker():
         sdr = st = None
-        ant = pick_antenna(mhz, "fm")
-        STATE["antenna"] = ANT_NICK.get(ant, ant)
+        ant = antenna or pick_antenna(mhz, "fm")
+        STATE["antenna"] = ANT_NICK.get(ant, ant) \
+            + ("" if antenna is None else " [manual]")
         for attempt in range(4):
             try:
                 sdr, st = open_sdr(mhz, ifgr=ifgr, rfgain=str(rfgain),
@@ -739,6 +751,13 @@ lie</div>
  &mdash; soon</button>
  <button class="knob" style="opacity:.4" title="campaign pending">SW
  &mdash; soon</button>
+ <select id="antsel" class="knob" style="float:right"
+  title="AUTO = the measured tune table picks per station">
+  <option value="auto">ANT: AUTO (measured)</option>
+  <option value="a">ANT: rabbit ears (A)</option>
+  <option value="b">ANT: Old Faithful (B)</option>
+  <option value="c">ANT: discone (C)</option>
+ </select>
 </div>
 <div id="freq">&mdash; &middot; &mdash;</div>
 <div id="nowplaying"><span class="t">welcome</span><br>
@@ -754,6 +773,8 @@ lie</div>
 <div style="text-align:center">
  <button class="knob" onclick="survey()">&#x1F4E1; SURVEY THE BAND</button>
  <button class="knob" onclick="stopL()">&#x23F9; STOP</button>
+ <button class="knob hot" id="castbtn" onclick="castToggle()">&#x1F50A;
+ CAST TO HOUSE</button>
 </div>
 <div id="status"></div>
 <div id="pbar"><div style="width:0%"></div></div>
@@ -767,14 +788,22 @@ async function survey(){document.getElementById('status').textContent=
 'surveying: sweeps the band, probes each strong station for HD (~4 min)';
 await fetch('/api/survey',{method:'POST'})}
 async function stopL(){await fetch('/api/stop',{method:'POST'})}
+let castOn=false;
+async function castToggle(){
+document.getElementById('status').textContent=castOn?
+'stopping whole-house cast...':'grouping the house and starting the stream...';
+await fetch('/api/cast',{method:'POST',body:JSON.stringify({on:!castOn})})}
+function antSel(){return document.getElementById('antsel').value}
 async function listenFM(mhz,name){
 document.getElementById('status').textContent='tuning '+mhz.toFixed(1)+
 ' analog (stereo v2) - audio in ~4 s';
-await fetch('/api/listen_fm',{method:'POST',body:JSON.stringify({mhz,name})})}
+await fetch('/api/listen_fm',{method:'POST',
+body:JSON.stringify({mhz,name,antenna:antSel()})})}
 async function listen(mhz,prog,name){
 document.getElementById('status').textContent='tuning '+mhz.toFixed(1)+
 ' program '+prog+' - audio in ~8-12 s';
-await fetch('/api/listen',{method:'POST',body:JSON.stringify({mhz,prog,name})})}
+await fetch('/api/listen',{method:'POST',
+body:JSON.stringify({mhz,prog,name,antenna:antSel()})})}
 function drawDial(cur){
 const c=document.getElementById('dialc'),g=c.getContext('2d');
 g.fillStyle='#02040a';g.fillRect(0,0,c.width,c.height);
@@ -829,6 +858,12 @@ if(s.antenna)ng+=ncard('ANTENNA (auto)',s.antenna+' ['+
 if(s.ifgr!=null)ng+=ncard('GAIN IN USE','IFGR '+s.ifgr+' / RF '+s.rfgain);
 ng+=ncard('RADIO LOCK',s.lock?(s.lock.owner+': '+
 (s.lock.purpose||'')):'free');
+const cb=document.getElementById('castbtn');
+if(s.cast){cb.style.display='';castOn=!!s.cast.on;
+cb.innerHTML=castOn?'&#x23F9; STOP CAST':'&#x1F50A; CAST TO HOUSE';
+if(castOn)ng+=ncard('CAST',(s.cast.zones||[]).join(', ')||'on');
+else if(s.cast.err)ng+=ncard('CAST',s.cast.err);}
+else{cb.style.display='none';}
 if(s.pilot_snr_db!=null){
 ng+=ncard('19K PILOT SNR',s.pilot_snr_db+' dB',s.pilot_snr_db/40*100);
 ng+=ncard('AUDIO SNR',s.audio_snr_db+' dB',s.audio_snr_db/50*100);
@@ -843,11 +878,31 @@ if(s.audio)ng+=ncard('AUDIO VERDICT',s.audio);
 document.getElementById('nerdgrid').innerHTML=ng;
 document.getElementById('daylab').textContent=
 s.daylab?('DAY LAB \\u25b8 '+s.daylab):'DAY LAB \\u25b8 idle';
+function grade(st,t){
+// measured listening-quality forecast, not vibes:
+// HD from the tune table's referee audio-seconds, FM from pilot SNR
+let hdg=null,fmg=null,ant='';
+if(t){const he=t.hd_evidence||{},fe=t.fm_evidence||{};
+if(t.hd_ant){hdg=he.aud>=10?'A':he.aud>0?'B':'C';}
+else if(st.hd){hdg='C';}
+fmg=(fe.pilot||-99)>=25?'A':(fe.pilot||-99)>=15?'B':
+(fe.pilot||-99)>6?'C':null;
+ant=(t.hd_ant||t.fm_ant||'').replace('Antenna ','');}
+else if(st.hd){hdg=st.mer_lo>=10?'A':st.mer_lo>=4?'B':'C';}
+return {hdg,fmg,ant};}
+const GCOL={A:'#39ff8a',B:'#ffb84d',C:'#ff6b4d'};
 let h='<table>';
 for(const st of stations){
-h+='<tr><td class="st">'+st.mhz.toFixed(1)+
+const t=(s.tune||{})[st.mhz.toFixed(1)];
+const g=grade(st,t);
+const w=Math.max(4,Math.min(100,st.rssi/40*100));
+h+='<tr><td class="st" style="min-width:230px">'+st.mhz.toFixed(1)+
 ' '+(st.name||'')+(st.hd?'<span class="hd">HD</span>':'')+
-(st.slogan?' <span class="rssi">'+st.slogan+'</span>':'')+'</td><td>';
+(g.ant?' <span class="rssi">&#x25B8; ant '+g.ant+'</span>':'')+
+'<div style="height:5px;margin-top:3px;background:#02040a;'+
+'border-radius:3px;overflow:hidden;max-width:220px">'+
+'<div style="height:100%;width:'+w+'%;background:linear-gradient('+
+'90deg,#00e5ff,'+(g.hdg?GCOL[g.hdg]:'#3f6a78')+')"></div></div></td><td>';
 if(st.hd){const progs=Object.keys(st.programs||{}).length?
 Object.entries(st.programs):[["0","HD1"]];
 for(const [p,label] of progs){h+='<button class="prog" onclick="listen('+
@@ -855,8 +910,10 @@ st.mhz+','+p+',\\''+(st.name||st.mhz)+'\\')">HD'+(parseInt(p)+1)+
 ' <span style="color:#3f6a78;font-size:10px">'+label+'</span></button>'}}
 h+='<button class="prog" style="border-color:#39ff8a" onclick="listenFM('+
 st.mhz+',\\''+(st.name||st.mhz)+'\\')">FM</button>';
-h+='</td><td class="rssi">+'+st.rssi+' dB'+
-(st.mer_lo!=null?' | MER '+st.mer_lo:'')+'</td></tr>'}
+h+='</td><td class="rssi" style="min-width:130px">+'+st.rssi+' dB'+
+(g.hdg?' | HD <b style="color:'+GCOL[g.hdg]+'">'+g.hdg+'</b>':'')+
+(g.fmg?' | FM <b style="color:'+GCOL[g.fmg]+'">'+g.fmg+'</b>':'')+
+'</td></tr>'}
 document.getElementById('guide').innerHTML=h+'</table>';
 }catch(e){}}
 setInterval(refresh,1500);refresh();
@@ -864,6 +921,7 @@ setInterval(refresh,1500);refresh();
 
 
 _DAYLAB = {"t": 0.0, "line": ""}
+_TUNE_CACHE = {"t": 0.0, "d": {}}
 
 
 def daylab_line():
@@ -902,6 +960,21 @@ class H(BaseHTTPRequestHandler):
             h = time.gmtime().tm_hour
             st["hour_band"] = "day" if 11 <= h < 19 else "evening"
             try:
+                import sonos_cast
+                st["cast"] = sonos_cast.status()
+            except Exception:
+                st["cast"] = None
+            # per-station measured quality (the tune-table's evidence)
+            now = time.time()
+            if now - _TUNE_CACHE["t"] > 5:
+                try:
+                    _TUNE_CACHE["d"] = json.loads(
+                        (LAB / "radio_tune_table.json").read_text())
+                except Exception:
+                    _TUNE_CACHE["d"] = {}
+                _TUNE_CACHE["t"] = now
+            st["tune"] = (_TUNE_CACHE["d"] or {}).get("stations", {})
+            try:
                 import radio_lock
                 st["lock"] = radio_lock.status()
             except Exception:
@@ -925,7 +998,9 @@ class H(BaseHTTPRequestHandler):
             threading.Thread(target=listen_fm,
                              args=(req["mhz"], req.get("name", ""),
                                    req.get("ifgr", 59),
-                                   req.get("rfgain", "3")),
+                                   req.get("rfgain", "3"),
+                                   ANT_PICK.get(req.get("antenna",
+                                                        "auto"))),
                              daemon=True).start()
             self._send('"listening analog"')
         elif self.path == "/api/listen":
@@ -933,12 +1008,30 @@ class H(BaseHTTPRequestHandler):
                              args=(req["mhz"], req["prog"],
                                    req.get("name", ""),
                                    req.get("ifgr", 59),
-                                   req.get("rfgain", "3")),
+                                   req.get("rfgain", "3"),
+                                   ANT_PICK.get(req.get("antenna",
+                                                        "auto"))),
                              daemon=True).start()
             self._send('"listening"')
         elif self.path == "/api/stop":
             threading.Thread(target=stop_listen, daemon=True).start()
+            try:
+                import sonos_cast
+                threading.Thread(target=sonos_cast.stop,
+                                 daemon=True).start()
+            except Exception:
+                pass
             self._send('"stopped"')
+        elif self.path == "/api/cast":
+            def do_cast():
+                import sonos_cast
+                if req.get("on"):
+                    name = STATE.get("name") or "radio"
+                    sonos_cast.start(f"ALBACORE TUNA RADIO - {name}")
+                else:
+                    sonos_cast.stop()
+            threading.Thread(target=do_cast, daemon=True).start()
+            self._send('"casting"')
         else:
             self.send_error(404)
 
