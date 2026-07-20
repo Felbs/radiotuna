@@ -69,7 +69,9 @@ STATE = {"mhz": None, "prog": None, "name": None, "listening": False,
          # stats-for-nerds: the knobs, live
          "decoder": None, "pilot_snr_db": None, "audio_snr_db": None,
          "stereo_blend": None, "fm_mode": None, "agc_db": None,
-         "antenna": None, "ifgr": None, "rfgain": None}
+         "antenna": None, "ifgr": None, "rfgain": None,
+         "album": None, "genre": None, "message": None, "tower": None,
+         "alert": None}
 
 FM_KEYS = ("pilot_snr_db", "audio_snr_db", "stereo_blend", "fm_mode",
            "agc_db")
@@ -256,7 +258,8 @@ def stop_listen():
         STATE.update({"listening": False, "mhz": None, "prog": None,
                       "name": None, "sync": False, "stage": "", "pct": 0,
                       "decoder": None, "antenna": None, "ifgr": None,
-                      "rfgain": None})
+                      "rfgain": None, "album": None, "genre": None,
+                      "message": None, "tower": None, "alert": None})
         STATE.update({k: None for k in FM_KEYS})
     for p in LIVE_PROCS:
         try:
@@ -383,6 +386,23 @@ def parse_nrsc5_line(line, info):
     m = re.search(r"Artist: (.+)", line)
     if m:
         info["artist"] = m.group(1).strip()
+    m = re.search(r"Album: (.+)", line)
+    if m:
+        info["album"] = m.group(1).strip()
+    m = re.search(r"Genre: (.+)", line)
+    if m:
+        info["genre"] = m.group(1).strip()
+    m = re.search(r"Message: (.+)", line)
+    if m:
+        info["message"] = m.group(1).strip()
+    m = re.search(r"Station location: ([-\d.]+), ([-\d.]+)", line)
+    if m:
+        info["tower"] = f"{m.group(1)}, {m.group(2)}"
+    m = re.search(r"Alert: (.+)", line)
+    if m:
+        info["alert"] = m.group(1).strip()
+    if "Alert ended" in line:
+        info["alert"] = None
 
 
 def run_survey():
@@ -494,8 +514,16 @@ def listen(mhz, prog, name, ifgr=59, rfgain="3", antenna=None):
         # STREAMING (2026-07-05): nrsc5 -r - reads IQ from stdin, so the
         # radio pumps straight into the decoder â€” no growing-file EOF
         # stall (this build stops at EOF instead of tailing).
+        aas = LAB / "aas"
+        aas.mkdir(exist_ok=True)
+        for old in aas.glob("*"):
+            try:
+                old.unlink()
+            except OSError:
+                pass
         nr = subprocess.Popen(
-            [NRSC5, "-r", "-", "-o", str(wav), str(prog)],
+            [NRSC5, "-r", "-", "-o", str(wav),
+             "--dump-aas-files", str(aas), str(prog)],
             stdin=subprocess.PIPE, stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT, text=False, env=_nrsc5_env())
         LIVE_PROCS.append(nr)
@@ -509,8 +537,9 @@ def listen(mhz, prog, name, ifgr=59, rfgain="3", antenna=None):
                 except AttributeError:
                     line = raw_line
                 parse_nrsc5_line(line, info)
-                for k in ("title", "artist", "mer_lo", "mer_hi",
-                          "ber", "sync"):
+                for k in ("title", "artist", "album", "genre",
+                          "message", "tower", "alert",
+                          "mer_lo", "mer_hi", "ber", "sync"):
                     if k in info:
                         STATE[k] = info[k]
         threading.Thread(target=scrape, daemon=True).start()
@@ -771,9 +800,16 @@ lie</div>
   <option value="c">ANT: discone (C)</option>
  </select>
 </div>
+<div id="alertbar" style="display:none;background:#5a0a0a;border:1px
+solid #ff3b3b;color:#ffd0d0;padding:8px 14px;border-radius:6px;
+margin:6px 0;text-shadow:0 0 8px rgba(255,59,59,.6)"></div>
 <div id="freq">&mdash; &middot; &mdash;</div>
-<div id="nowplaying"><span class="t">welcome</span><br>
-<span class="a">survey the band, then click a program</span></div>
+<div id="nowplaying" style="display:flex;gap:14px;align-items:center;
+justify-content:center">
+<img id="art" style="display:none;width:72px;height:72px;
+border-radius:6px;border:1px solid rgba(0,229,255,.35)">
+<div><span class="t">welcome</span><br>
+<span class="a">survey the band, then click a program</span></div></div>
 <div id="dial"><canvas id="dialc" width="1880" height="120"></canvas></div>
 <div class="meters">
  <div class="meter"><div class="k">MER LO</div><div class="v" id="mlo">&mdash;</div></div>
@@ -842,9 +878,21 @@ const s=await (await fetch('/api/state')).json();
 stations=s.stations||[];
 document.getElementById('freq').textContent=
 s.mhz?s.mhz.toFixed(1)+' FM':'\\u2014 \\u00b7 \\u2014';
-if(s.listening){document.getElementById('nowplaying').innerHTML=
+if(s.listening){
+document.getElementById('nowplaying').lastElementChild.innerHTML=
 '<span class="t">'+(s.title||s.name||'')+'</span><br><span class="a">'+
-(s.artist||'')+'</span>'}
+(s.artist||'')+(s.album?' &mdash; '+s.album:'')+'</span>'+
+(s.message?'<br><span class="rssi">'+s.message+'</span>':'');
+const art=document.getElementById('art');
+const key=(s.title||'')+(s.artist||'');
+if(s.prog!=null&&key!==art.dataset.k){art.dataset.k=key;
+art.src='/api/art?'+Date.now();art.onload=()=>art.style.display='';
+art.onerror=()=>art.style.display='none';}
+if(s.prog==null){art.style.display='none';}}
+const ab=document.getElementById('alertbar');
+if(s.alert){ab.style.display='';ab.textContent=
+'\\u26a0 EMERGENCY ALERT: '+s.alert;}
+else{ab.style.display='none';}
 document.getElementById('mlo').textContent=s.mer_lo??'\\u2014';
 document.getElementById('mhi').textContent=s.mer_hi??'\\u2014';
 document.getElementById('ber').textContent=s.ber!=null?s.ber.toFixed(4):'\\u2014';
@@ -890,6 +938,8 @@ if(s.mer_lo!=null)ng+=ncard('MER LO/HI',s.mer_lo+' / '+(s.mer_hi??'?')+
 if(s.ber!=null)ng+=ncard('BER',s.ber.toFixed(4),
 100-Math.min(100,s.ber*2000));
 if(s.audio)ng+=ncard('AUDIO VERDICT',s.audio);
+if(s.genre)ng+=ncard('GENRE',s.genre);
+if(s.tower)ng+=ncard('TOWER LOCATION',s.tower);
 document.getElementById('nerdgrid').innerHTML=ng;
 document.getElementById('daylab').textContent=
 s.daylab?('DAY LAB \\u25b8 '+s.daylab):'DAY LAB \\u25b8 idle';
@@ -968,6 +1018,21 @@ class H(BaseHTTPRequestHandler):
     def do_GET(self):
         if self.path == "/":
             self._send(PAGE, "text/html; charset=utf-8")
+        elif self.path.startswith("/api/art"):
+            # newest image the station pushed (album art / logo LOTs)
+            imgs = sorted(
+                (LAB / "aas").glob("*.jp*g"), key=lambda p:
+                p.stat().st_mtime, reverse=True) + sorted(
+                (LAB / "aas").glob("*.png"), key=lambda p:
+                p.stat().st_mtime, reverse=True)
+            imgs = sorted(imgs, key=lambda p: p.stat().st_mtime,
+                          reverse=True)
+            if imgs:
+                ctype = ("image/png" if imgs[0].suffix == ".png"
+                         else "image/jpeg")
+                self._send(imgs[0].read_bytes(), ctype)
+            else:
+                self.send_error(404)
         elif self.path == "/api/state":
             st = dict(STATE)
             st["survey"] = dict(SURVEY)
