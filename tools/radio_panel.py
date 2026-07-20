@@ -232,6 +232,14 @@ def _band_sweeper():
                     sdr.closeStream(st_)
             except Exception:
                 pass
+            # closeStream is NOT enough: the Device object keeps the
+            # SDRplay hardware claimed until GC, so a yielding sweeper
+            # left the radio busy-with-no-lock and starved the labs
+            # (7/20 errand-labs launch). Drop and collect NOW.
+            sdr = st_ = None
+            import gc
+            gc.collect()
+            time.sleep(0.5)
             radio_lock.release("panel_idle")
 
 
