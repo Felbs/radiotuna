@@ -10,7 +10,9 @@ build (ALBACORE=1); analog FM through fm_stereo.py v2.
   SURVEY â€” two stages: wideband FFT sweep finds carriers (~10 s), then
            nrsc5 probes the strong ones for HD (name, slogan, programs).
            Results cached to lab/stations.json (the radio guide).
-  LISTEN â€” click a subchannel: SDR pump -> nrsc5 -> growing WAV -> mpv,
+  LISTEN â€” click a subchannel: SDR pump -> nrsc5 -> audio PIPE -> mpv
+  (tee to a per-session WAV for meters/cast; a player tailing a growing
+  file stutters at the live edge = ear-static while the file meters clean),
            stats and metadata streaming to the panel.
 """
 import json
@@ -57,6 +59,14 @@ def _nrsc5_env():
     return e
 MPV = (_os.environ.get("MPV_EXE") or _sh.which("mpv")
        or r"C:\Program Files\MPV Player\mpv.exe")
+# the live pipe-attached player (HD path) — module-global so the cast
+# endpoints can detach/reattach the local speakers to the audio pipe
+PLAYER = {"mpv": None}
+MPV_PIPE_ARGS = ["-", "--volume=100", "--cache=yes", "--cache-secs=2",
+                 "--force-window=no", "--demuxer=rawaudio",
+                 "--demuxer-rawaudio-rate=44100",
+                 "--demuxer-rawaudio-channels=2",
+                 "--demuxer-rawaudio-format=s16le"]
 STATIONS = LAB / "stations.json"
 PORT = 8643
 FS_NRSC5 = 1_488_375.0
@@ -291,6 +301,7 @@ def stop_listen():
                       "rfgain": None, "album": None, "genre": None,
                       "message": None, "tower": None, "alert": None})
         STATE.update({k: None for k in FM_KEYS})
+    PLAYER["mpv"] = None
     for p in LIVE_PROCS:
         try:
             p.terminate()
@@ -576,17 +587,40 @@ def listen(mhz, prog, name, ifgr=59, rfgain="3", antenna=None):
                 old.unlink()
             except OSError:
                 pass
+        # AUDIO OVER A PIPE (7/20, the ear-static bug): a player tailing
+        # the growing WAV stutter-loops whenever it catches the live
+        # edge — the ear hears heavy static while the FILE meters clean
+        # (hd_listen.py's law; this panel was the last place still
+        # tailing). nrsc5 now writes audio to stdout; audio_tee copies
+        # it to the session WAV (meters + cast) and, once the quality
+        # gate opens, into mpv's stdin as a continuous stream.
         nr = subprocess.Popen(
-            [NRSC5, "-r", "-", "-o", str(wav),
+            [NRSC5, "-r", "-", "-o", "-",
              "--dump-aas-files", str(aas), str(prog)],
             stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT, text=False, env=_nrsc5_env())
+            stderr=subprocess.PIPE, text=False, env=_nrsc5_env())
         LIVE_PROCS.append(nr)
         STATE["decoder"] = DECODER_TAG
         info = {}
 
+        def audio_tee():
+            with open(wav, "wb") as f:
+                while True:
+                    chunk = nr.stdout.read(8192)
+                    if not chunk:
+                        return
+                    f.write(chunk)
+                    m = PLAYER["mpv"]
+                    if m is not None:
+                        try:
+                            m.stdin.write(chunk)
+                            m.stdin.flush()
+                        except (BrokenPipeError, OSError):
+                            PLAYER["mpv"] = None
+        threading.Thread(target=audio_tee, daemon=True).start()
+
         def scrape():
-            for raw_line in nr.stdout:
+            for raw_line in nr.stderr:
                 try:
                     line = raw_line.decode("utf-8", "replace")
                 except AttributeError:
@@ -628,7 +662,11 @@ def listen(mhz, prog, name, ifgr=59, rfgain="3", antenna=None):
         threading.Thread(target=bank_logo, daemon=True).start()
         set_stage(45, "decoder hunting sync")
         nr_t0 = time.time()
-        mpv = None
+        # attached is session-LOCAL on purpose: PLAYER is a global slot
+        # that casting (and the next session) may null — reading it in
+        # the fall logic let a stale worker hijack a fresh click into
+        # analog, and would end a cast in a bogus fallback after 45 s
+        attached = False
         low_mer_since = None
         # LOSSLESS PUMP (2026-07-05): the SDR loop must NEVER block on the
         # decoder's pipe â€” backpressure was stalling reads, dropping
@@ -686,10 +724,10 @@ def listen(mhz, prog, name, ifgr=59, rfgain="3", antenna=None):
             fall = None
             if not STATE.get("sync") and time.time() - nr_t0 > 25:
                 fall = "no HD sync â€” digital too weak here"
-            elif STATE.get("sync") and mpv is None \
+            elif STATE.get("sync") and not attached \
                     and time.time() - nr_t0 > 45:
                 fall = "HD synced but no audio is decoding"
-            elif mpv is None and STATE.get("sync") \
+            elif not attached and STATE.get("sync") \
                     and (STATE.get("mer_lo") or 99) < 9.5:
                 low_mer_since = low_mer_since or time.time()
                 if time.time() - low_mer_since > 12:
@@ -698,6 +736,11 @@ def listen(mhz, prog, name, ifgr=59, rfgain="3", antenna=None):
             else:
                 low_mer_since = None
             if fall:
+                if GEN[0] != my_gen:
+                    # a newer click owns the radio — a stale worker
+                    # must never spawn a fallback over it (this race
+                    # turned an HD2 click into analog, 7/20)
+                    break
                 set_stage(30, fall + "; switching to analog FMâ€¦")
                 close_sdr(sdr, st)
                 try:
@@ -707,17 +750,21 @@ def listen(mhz, prog, name, ifgr=59, rfgain="3", antenna=None):
                 threading.Thread(target=listen_fm, args=(mhz, name),
                                  daemon=True).start()
                 return
-            if mpv is None and STATE.get("sync") \
+            if not attached and STATE.get("sync") \
                     and (STATE.get("mer_lo") or 0) >= 9.5 \
                     and wav.exists() and wav.stat().st_size > 400_000:
                 # audio gates on SYNC + MER above the cliff + real
-                # audio bytes: sync alone is not audio (stress-tested)
+                # audio bytes: sync alone is not audio (stress-tested).
+                # The player joins the PIPE at the live edge — never
+                # the file (growing-file tailing = the ear-static bug).
                 set_stage(88, "buffering audio")
-                mpv = subprocess.Popen(
-                    [MPV, str(wav), "--volume=100", "--keep-open=yes",
-                     "--force-seekable=yes",
-                     f"--title=Radio Tuna â€” {name}"])
-                LIVE_PROCS.append(mpv)
+                m = subprocess.Popen(
+                    [MPV] + MPV_PIPE_ARGS
+                    + [f"--title=Radio Tuna â€” {name}"],
+                    stdin=subprocess.PIPE)
+                LIVE_PROCS.append(m)
+                PLAYER["mpv"] = m
+                attached = True
                 set_stage(100, "")
         try:
             nr.stdin.close()
@@ -1336,11 +1383,24 @@ class H(BaseHTTPRequestHandler):
                         # the house runs ~15 s behind the burst buffer;
                         # two copies at an offset is an echo chamber —
                         # the PC yields to the whole-house stream
+                        PLAYER["mpv"] = None
                         subprocess.run(["taskkill", "/F", "/IM",
                                         "mpv.exe"], capture_output=True)
                 else:
                     cast_local.stop()
                     # bring local audio back if a station is playing
+                    if STATE.get("listening") \
+                            and STATE.get("prog") is not None:
+                        # HD session: reattach the speakers to the live
+                        # audio pipe (never tail the file — ear-static)
+                        m = subprocess.Popen(
+                            [MPV] + MPV_PIPE_ARGS
+                            + [f"--title=ALBACORE TUNA - "
+                               f"{STATE.get('name') or ''}"],
+                            stdin=subprocess.PIPE)
+                        LIVE_PROCS.append(m)
+                        PLAYER["mpv"] = m
+                        return
                     wav = LAB / (STATE.get("wav") or "radio_live.wav")
                     if STATE.get("listening") and wav.exists():
                         mpv = subprocess.Popen(
