@@ -550,11 +550,21 @@ def listen(mhz, prog, name, ifgr=59, rfgain="3", antenna=None):
             STATE.update({"listening": False})
             return
         set_stage(30, "receiving â€” streaming into the HD decoder")
-        wav = LAB / "radio_live.wav"
-        try:
-            wav.unlink()
-        except OSError:
-            pass
+        # ONE FILE PER SESSION (the analog-then-HD static bug, 7/20):
+        # on Windows the previous session's player still holds
+        # radio_live.wav, the unlink fails SILENTLY, and the new
+        # decoder collides with the old file's bytes/size — the size
+        # gate passed instantly on stale content and mpv played the
+        # corpse. Unique names make collision impossible; old files
+        # are swept best-effort (locked ones die with their player).
+        wav = LAB / f"live_{my_gen}.wav"
+        for old in LAB.glob("live_*.wav"):
+            if old != wav:
+                try:
+                    old.unlink()
+                except OSError:
+                    pass
+        STATE["wav"] = wav.name
         buf = np.empty(2 * 65536, np.int16)
         # STREAMING (2026-07-05): nrsc5 -r - reads IQ from stdin, so the
         # radio pumps straight into the decoder â€” no growing-file EOF
@@ -762,11 +772,15 @@ def listen_fm(mhz, name, ifgr=59, rfgain="3", antenna=None):
             STATE.update({"listening": False})
             return
         set_stage(55, "demodulating FM (stereo v2)")
-        wav = LAB / "radio_live.wav"
-        try:
-            wav.unlink()
-        except OSError:
-            pass
+        # one file per session — see the HD path's collision note
+        wav = LAB / f"live_{my_gen}.wav"
+        for old in LAB.glob("live_*.wav"):
+            if old != wav:
+                try:
+                    old.unlink()
+                except OSError:
+                    pass
+        STATE["wav"] = wav.name
         fh = open(wav, "wb")
         fh.write(fm_stereo.wav_header(fm_stereo.FS_AUDIO, 2))
         fh.flush()
@@ -1327,7 +1341,7 @@ class H(BaseHTTPRequestHandler):
                 else:
                     cast_local.stop()
                     # bring local audio back if a station is playing
-                    wav = LAB / "radio_live.wav"
+                    wav = LAB / (STATE.get("wav") or "radio_live.wav")
                     if STATE.get("listening") and wav.exists():
                         mpv = subprocess.Popen(
                             [MPV, str(wav), "--volume=100",
