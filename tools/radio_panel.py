@@ -333,10 +333,13 @@ def hd_probe(mhz, secs=8):
     close_sdr(sdr, st)
     info = {"hd": False, "name": None, "slogan": None, "programs": {},
             "mer_lo": None, "mer_hi": None, "ber": None}
+    aas = LAB / "aas_guide" / f"{mhz:.1f}"
+    aas.mkdir(parents=True, exist_ok=True)
     keeper = subprocess.Popen(["powershell", "-NoProfile", "-Command",
                                "Start-Sleep -Seconds 90"],
                               stdout=subprocess.PIPE)
-    p = subprocess.Popen([NRSC5, "-r", str(iq), str(0)],
+    p = subprocess.Popen([NRSC5, "-r", str(iq),
+                          "--dump-aas-files", str(aas), str(0)],
                          stdin=keeper.stdout, stdout=subprocess.PIPE,
                          stderr=subprocess.STDOUT, text=True,
                          errors="replace", env=_nrsc5_env())
@@ -433,6 +436,9 @@ def run_survey():
                                   f"{info.get('name') or 'HD station'} "
                                   f"decoded ({done}/{len(strong)})")
             SURVEY["pct"] = 15 + int(80 * done / max(1, len(strong)))
+            logos = sorted((LAB / "aas_guide" / f"{mhz:.1f}").glob("*.png")) \
+                + sorted((LAB / "aas_guide" / f"{mhz:.1f}").glob("*.jp*g"))
+            logos = sorted(logos, key=lambda p: p.stat().st_size)
             stations.append({"mhz": mhz, "rssi": rssi,
                              "hd": info.get("hd", False),
                              "name": info.get("name"),
@@ -440,7 +446,11 @@ def run_survey():
                              "programs": info.get("programs", {}),
                              "mer_lo": info.get("mer_lo"),
                              "mer_hi": info.get("mer_hi"),
-                             "ber": info.get("ber")})
+                             "ber": info.get("ber"),
+                             "genre": info.get("genre"),
+                             "message": info.get("message"),
+                             "tower": info.get("tower"),
+                             "logo": logos[0].name if logos else None})
             STATIONS.write_text(json.dumps(
                 {"surveyed_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
                  "stations": stations}, indent=1), encoding="utf-8")
@@ -961,9 +971,18 @@ for(const st of stations){
 const t=(s.tune||{})[st.mhz.toFixed(1)];
 const g=grade(st,t);
 const w=Math.max(4,Math.min(100,st.rssi/40*100));
-h+='<tr><td class="st" style="min-width:230px">'+st.mhz.toFixed(1)+
+const isLive=s.listening&&s.mhz===st.mhz;
+h+='<tr'+(isLive?' style="background:rgba(255,43,214,.07)"':'')+
+'><td style="width:40px">'+
+(st.logo?'<img src="/api/logo?mhz='+st.mhz.toFixed(1)+
+'" style="width:34px;height:34px;border-radius:4px" '+
+'onerror="this.style.display=\\'none\\'">':'')+'</td>'+
+'<td class="st" style="min-width:230px">'+st.mhz.toFixed(1)+
 ' '+(st.name||'')+(st.hd?'<span class="hd">HD</span>':'')+
+(st.genre?' <span class="rssi">'+st.genre+'</span>':'')+
 (g.ant?' <span class="rssi">&#x25B8; ant '+g.ant+'</span>':'')+
+(isLive?'<br><span style="color:#ff2bd6">&#x25B6; NOW: '+
+(s.title||'')+(s.artist?' &mdash; '+s.artist:'')+'</span>':'')+
 '<div style="height:5px;margin-top:3px;background:#02040a;'+
 'border-radius:3px;overflow:hidden;max-width:220px">'+
 '<div style="height:100%;width:'+w+'%;background:linear-gradient('+
@@ -1018,6 +1037,19 @@ class H(BaseHTTPRequestHandler):
     def do_GET(self):
         if self.path == "/":
             self._send(PAGE, "text/html; charset=utf-8")
+        elif self.path.startswith("/api/logo"):
+            # station logo banked by the survey: /api/logo?mhz=93.3
+            try:
+                mhz = self.path.split("mhz=")[1].split("&")[0]
+                st = json.loads(STATIONS.read_text(encoding="utf-8"))
+                ent = next(s for s in st["stations"]
+                           if f"{s['mhz']:.1f}" == mhz)
+                p = LAB / "aas_guide" / mhz / ent["logo"]
+                ctype = ("image/png" if p.suffix == ".png"
+                         else "image/jpeg")
+                self._send(p.read_bytes(), ctype)
+            except Exception:
+                self.send_error(404)
         elif self.path.startswith("/api/art"):
             # newest image the station pushed (album art / logo LOTs)
             imgs = sorted(
