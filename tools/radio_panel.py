@@ -874,6 +874,11 @@ border-radius:6px;border:1px solid rgba(0,229,255,.35)">
 <span class="a">survey the band, then click a program</span></div></div>
 <div id="dial"><canvas id="dialc" width="1880" height="120"></canvas></div>
 <div class="meters">
+ <div class="meter" id="hdqbox" style="display:none;min-width:150px">
+  <div class="k">HD QUALITY</div><div class="v" id="hdq">&mdash;</div>
+  <div style="height:6px;background:#02040a;border-radius:3px;
+  overflow:hidden;margin-top:3px"><div id="hdqbar"
+  style="height:100%;width:0%"></div></div></div>
  <div class="meter"><div class="k">MER LO</div><div class="v" id="mlo">&mdash;</div></div>
  <div class="meter"><div class="k">MER HI</div><div class="v" id="mhi">&mdash;</div></div>
  <div class="meter"><div class="k">BER</div><div class="v" id="ber">&mdash;</div></div>
@@ -955,6 +960,23 @@ const ab=document.getElementById('alertbar');
 if(s.alert){ab.style.display='';ab.textContent=
 '\\u26a0 EMERGENCY ALERT: '+s.alert;}
 else{ab.style.display='none';}
+// HD QUALITY: MER vs the measured cliff. >=13 solid, 11-13 will
+// stutter, <9.5 will not hold (the FM button is the better ear).
+const hb=document.getElementById('hdqbox');
+if(s.prog!=null&&s.mer_lo!=null){
+const mer=(Number(s.mer_lo)+Number(s.mer_hi||s.mer_lo))/2;
+const q=Math.max(0,Math.min(100,(mer-8)/6*100));
+const lbl=mer>=13?'SOLID':mer>=11?'OK':mer>=9.5?'FRAGILE':'TOO WEAK';
+const col=mer>=13?'#39ff8a':mer>=11?'#ffb84d':'#ff6b4d';
+hb.style.display='';
+document.getElementById('hdq').textContent=lbl;
+document.getElementById('hdq').style.color=col;
+const qb=document.getElementById('hdqbar');
+qb.style.width=q+'%';qb.style.background=col;
+if(mer<11&&s.pct===100)document.getElementById('status').textContent=
+'HD is fragile here (MER '+mer.toFixed(1)+') \\u2014 expect dropouts;'+
+' the FM button will sound cleaner';
+}else{hb.style.display='none';}
 document.getElementById('mlo').textContent=s.mer_lo??'\\u2014';
 document.getElementById('mhi').textContent=s.mer_hi??'\\u2014';
 document.getElementById('ber').textContent=s.ber!=null?s.ber.toFixed(4):'\\u2014';
