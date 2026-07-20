@@ -224,6 +224,36 @@ def open_sdr(mhz, ifgr=59.0, rfgain="3", rate=FS_CAP, ant="Antenna A"):
     return sdr, st
 
 
+def heal_sdr_service():
+    """The SDRplay API wedges after rapid open/close storms (a 28-
+    station scan is ~30 cycles). A service restart clears it — do it
+    automatically instead of telling the human the radio is haunted."""
+    subprocess.run(["powershell", "-NoProfile", "-Command",
+                    "Restart-Service SDRplayAPIService -Force"],
+                   capture_output=True, timeout=90)
+    time.sleep(6)
+    # burn the post-restart dud session (law: the first session after
+    # a service restart streams deaf; the lab burns one, so do we)
+    try:
+        _ensure_sdr_dll_path()
+        import SoapySDR
+        from SoapySDR import SOAPY_SDR_RX, SOAPY_SDR_CS16
+        sdr = SoapySDR.Device("driver=sdrplay")
+        sdr.setSampleRate(SOAPY_SDR_RX, 0, FS_CAP)
+        sdr.setFrequency(SOAPY_SDR_RX, 0, 93.3e6)
+        st = sdr.setupStream(SOAPY_SDR_RX, SOAPY_SDR_CS16)
+        sdr.activateStream(st)
+        buf = np.empty(2 * 65536, np.int16)
+        t0 = time.time()
+        while time.time() - t0 < 2.5:
+            sdr.readStream(st, [buf], 65536, timeoutUs=300000)
+        sdr.deactivateStream(st)
+        sdr.closeStream(st)
+        time.sleep(1)
+    except Exception:
+        pass
+
+
 def close_sdr(sdr, st):
     try:
         sdr.deactivateStream(st)
@@ -499,7 +529,7 @@ def listen(mhz, prog, name, ifgr=59, rfgain="3", antenna=None):
         ant = antenna or pick_antenna(mhz, "hd")
         STATE["antenna"] = ANT_NICK.get(ant, ant) \
             + ("" if antenna is None else " [manual]")
-        for attempt in range(4):          # post-restart contention retry
+        for attempt in range(5):          # post-restart contention retry
             try:
                 sdr, st = open_sdr(mhz, ifgr=ifgr, rfgain=str(rfgain),
                                    ant=ant)
@@ -507,7 +537,12 @@ def listen(mhz, prog, name, ifgr=59, rfgain="3", antenna=None):
             except Exception:
                 if GEN[0] != my_gen:
                     return
-                set_stage(8, f"radio busy â€” retrying ({attempt + 2}/4)")
+                if attempt == 2:
+                    set_stage(8, "radio service wedged - self-healing "
+                                 "(one moment)")
+                    heal_sdr_service()
+                    continue
+                set_stage(8, f"radio busy â€” retrying ({attempt + 2}/5)")
                 time.sleep(2.5)
         if sdr is None:
             set_stage(0, "RADIO UNAVAILABLE â€” another process holds the "
@@ -685,7 +720,7 @@ def listen_fm(mhz, name, ifgr=59, rfgain="3", antenna=None):
         ant = antenna or pick_antenna(mhz, "fm")
         STATE["antenna"] = ANT_NICK.get(ant, ant) \
             + ("" if antenna is None else " [manual]")
-        for attempt in range(4):
+        for attempt in range(5):
             try:
                 sdr, st = open_sdr(mhz, ifgr=ifgr, rfgain=str(rfgain),
                                    ant=ant)
@@ -693,7 +728,12 @@ def listen_fm(mhz, name, ifgr=59, rfgain="3", antenna=None):
             except Exception:
                 if GEN[0] != my_gen:
                     return
-                set_stage(15, f"radio busy â€” retrying ({attempt + 2}/4)")
+                if attempt == 2:
+                    set_stage(15, "radio service wedged - self-healing "
+                                  "(one moment)")
+                    heal_sdr_service()
+                    continue
+                set_stage(15, f"radio busy â€” retrying ({attempt + 2}/5)")
                 time.sleep(2.5)
         if sdr is None:
             set_stage(0, "RADIO UNAVAILABLE â€” another process holds the "
