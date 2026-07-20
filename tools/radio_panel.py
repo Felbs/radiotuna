@@ -89,6 +89,7 @@ STATE = {"mhz": None, "prog": None, "name": None, "listening": False,
 # (the don't-hammer-the-chain law). ±250 kHz around the dial: the
 # station, its HD sidebands, and the neighbors.
 import collections as _collections
+from datetime import datetime
 SPEC = {"pend": None, "last": 0.0,
         "rows": _collections.deque(maxlen=60)}
 SPEC_SPAN = 250e3
@@ -129,6 +130,111 @@ def _spec_worker():
 
 
 threading.Thread(target=_spec_worker, daemon=True).start()
+
+# ── idle full-band waterfall ─────────────────────────────────────────
+# When nobody is listening, sweep 88-108 MHz (4 hops @ 8 MS/s, fixed
+# gain so the stitch is seamless) and feed the same waterfall. Lowest
+# radio priority of anything in the house (10 < warden 20 < labs 50 <
+# human 80 < pass 100): yields via should_yield() between hops, stands
+# off satellite pass windows, and stops the instant a listen starts.
+BAND = {"rows": _collections.deque(maxlen=45)}
+BAND_LO, BAND_HI, BAND_BINS = 88.0e6, 108.0e6, 1000
+
+
+def _band_sweeper():
+    import radio_lock
+    hops = [90.5e6, 96.0e6, 101.5e6, 107.0e6]
+    RATE, N = 8e6, 8192
+    win = np.hanning(N).astype(np.float32)
+    while True:
+        time.sleep(1.0)
+        if STATE.get("listening"):
+            continue
+        try:
+            wst = json.loads(Path(
+                r"Z:\src\wxTuna\lab\wxsat_status.json").read_text())
+            rec, los = wst.get("rec_start"), wst.get("next_los")
+            if wst.get("state") == "recording":
+                continue
+            if rec and los:
+                t0 = datetime.fromisoformat(
+                    rec.replace("Z", "+00:00")).timestamp()
+                t1 = datetime.fromisoformat(
+                    los.replace("Z", "+00:00")).timestamp()
+                if t0 - 120 <= time.time() <= t1 + 120:
+                    continue
+        except Exception:
+            pass
+        if not radio_lock.acquire("panel_idle", "idle band waterfall",
+                                  10, wait_s=0):
+            time.sleep(4)
+            continue
+        sdr = st_ = None
+        try:
+            _ensure_sdr_dll_path()
+            import SoapySDR
+            from SoapySDR import SOAPY_SDR_RX, SOAPY_SDR_CS16
+            SoapySDR.SoapySDR_setLogLevel(SoapySDR.SOAPY_SDR_FATAL)
+            sdr = SoapySDR.Device("driver=sdrplay")
+            sdr.setSampleRate(SOAPY_SDR_RX, 0, RATE)
+            sdr.setAntenna(SOAPY_SDR_RX, 0, "Antenna C")
+            sdr.setGainMode(SOAPY_SDR_RX, 0, False)
+            try:
+                sdr.setGain(SOAPY_SDR_RX, 0, "IFGR", 45)
+            except Exception:
+                pass
+            st_ = sdr.setupStream(SOAPY_SDR_RX, SOAPY_SDR_CS16)
+            sdr.activateStream(st_)
+            buf = np.empty(2 * 65536, np.int16)
+            while not STATE.get("listening") \
+                    and not radio_lock.should_yield():
+                row = np.full(BAND_BINS, np.nan, np.float32)
+                for hop in hops:
+                    if STATE.get("listening") or radio_lock.should_yield():
+                        break
+                    sdr.setFrequency(SOAPY_SDR_RX, 0, hop)
+                    for _ in range(5):                    # retune settle
+                        sdr.readStream(st_, [buf], 65536, timeoutUs=300000)
+                    acc = None
+                    for _ in range(6):
+                        r = sdr.readStream(st_, [buf], 65536,
+                                           timeoutUs=300000)
+                        if r.ret != 65536:
+                            continue
+                        x = (buf[0:2 * N:2].astype(np.float32)
+                             + 1j * buf[1:2 * N:2].astype(np.float32))
+                        p = np.abs(np.fft.fft(x * win)) ** 2
+                        acc = p if acc is None else acc + p
+                    if acc is None:
+                        continue
+                    db = 10 * np.log10(np.fft.fftshift(acc) + 1e-6)
+                    fax = np.fft.fftshift(
+                        np.fft.fftfreq(N, 1 / RATE)) + hop
+                    use = np.abs(fax - hop) < 3.4e6
+                    bi = ((fax[use] - BAND_LO) / (BAND_HI - BAND_LO)
+                          * BAND_BINS).astype(int)
+                    ok = (bi >= 0) & (bi < BAND_BINS)
+                    np.fmax.at(row, bi[ok], db[use][ok].astype(np.float32))
+                if np.isfinite(row).any():
+                    fill = float(np.nanmin(row))
+                    r2 = np.where(np.isfinite(row), row, fill)
+                    BAND["rows"].append(
+                        {"t": round(time.time(), 3),
+                         "db": np.round(r2, 1).tolist()})
+                radio_lock.heartbeat()
+        except Exception:
+            time.sleep(5)
+        finally:
+            try:
+                if sdr is not None:
+                    sdr.deactivateStream(st_)
+                    sdr.closeStream(st_)
+            except Exception:
+                pass
+            radio_lock.release("panel_idle")
+
+
+threading.Thread(target=_band_sweeper, daemon=True).start()
 
 FM_KEYS = ("pilot_snr_db", "audio_snr_db", "stereo_blend", "fm_mode",
            "agc_db")
@@ -1097,8 +1203,9 @@ border-radius:6px;border:1px solid rgba(0,229,255,.35)">
 <div id="dial"><canvas id="dialc" width="1880" height="120"></canvas></div>
 <div id="specbox" style="display:none;background:#02040a;border:1px solid
 rgba(0,229,255,.35);border-radius:6px;margin:10px 0;padding:8px">
- <div style="font-size:10px;color:#3f6a78;letter-spacing:2px">
- LIVE SPECTRUM &middot; &plusmn;250 kHz AROUND THE DIAL</div>
+ <div id="speclabel" style="font-size:10px;color:#3f6a78;
+ letter-spacing:2px">LIVE SPECTRUM &middot; &plusmn;250 kHz AROUND
+ THE DIAL</div>
  <canvas id="specline" width="688" height="80"
   style="width:100%;height:80px;display:block"></canvas>
  <canvas id="wfall" width="688" height="150"
@@ -1169,13 +1276,40 @@ const v=Math.max(0,Math.min(1,(db[bin]-specLo)/rng));
 const y=line.height-3-v*(line.height-8);
 if(x===0)lg.moveTo(x,y);else lg.lineTo(x,y)}
 lg.stroke();lg.shadowBlur=0}
+let specMode=null;
+function bandX(mhz,w){return (mhz-88.0)/20.0*w}
+function drawBandMarks(lg,w,h){
+// channel ruler: a tick each MHz, label every 4; station marks from
+// the guide; HD stations get magenta sideband shading (the +-129 to
+// +-198 kHz shelves where ALL the subchannels HD1-HD3 actually live)
+lg.strokeStyle='#113a4a';lg.fillStyle='#4a8a9a';lg.font='10px Consolas';
+for(let m=88;m<=108;m++){const x=bandX(m,w);lg.beginPath();
+lg.moveTo(x,0);lg.lineTo(x,m%4===0?12:6);lg.stroke();
+if(m%4===0)lg.fillText(m,x+2,11)}
+for(const s of stations){const x=bandX(s.mhz,w);
+if(s.hd){const x1=bandX(s.mhz-0.198,w),x2=bandX(s.mhz-0.129,w),
+x3=bandX(s.mhz+0.129,w),x4=bandX(s.mhz+0.198,w);
+lg.fillStyle='rgba(255,43,214,.22)';
+lg.fillRect(x1,0,x2-x1,h);lg.fillRect(x3,0,x4-x3,h);
+const np_=Object.keys(s.programs||{}).length||1;
+lg.fillStyle='#ff8fe8';lg.font='9px Consolas';
+lg.fillText('HD'+(np_>1?'×'+np_:''),x-9,h-3)}
+lg.strokeStyle=s.hd?'rgba(0,229,255,.8)':'rgba(51,86,106,.8)';
+lg.beginPath();lg.moveTo(x,0);lg.lineTo(x,h);lg.stroke()}}
 async function specPoll(){try{
 const r=await(await fetch('/api/spectrum?since='+specT)).json();
 const rows=r.rows||[];
 const box=document.getElementById('specbox');
+if(r.mode!==specMode){specMode=r.mode;specT=0;specLo=specHi=null;
+const wf=document.getElementById('wfall');
+wf.getContext('2d').clearRect(0,0,wf.width,wf.height);
+document.getElementById('speclabel').textContent=
+r.mode==='band'?'FULL FM BAND · 88–108 MHz · idle sweep':
+'LIVE SPECTRUM · ±250 kHz AROUND THE DIAL'}
 if(rows.length){specT=rows[rows.length-1].t;
-box.style.display='block';drawSpecRows(rows)}
-else if(!r.listening){box.style.display='none';specLo=specHi=null}
+box.style.display='block';drawSpecRows(rows);
+if(r.mode==='band'){const line=document.getElementById('specline');
+drawBandMarks(line.getContext('2d'),line.width,line.height)}}
 }catch(e){}
 setTimeout(specPoll,350)}
 specPoll();
@@ -1427,12 +1561,16 @@ class H(BaseHTTPRequestHandler):
                                   .split("&")[0])
                 except ValueError:
                     pass
-            rows = [r for r in list(SPEC["rows"]) if r["t"] > since]
-            self._send(json.dumps({"mhz": STATE.get("mhz"),
-                                   "span_hz": 2 * SPEC_SPAN,
-                                   "listening": bool(
-                                       STATE.get("listening")),
-                                   "rows": rows[-30:]}))
+            listening = bool(STATE.get("listening"))
+            src = SPEC["rows"] if listening else BAND["rows"]
+            rows = [r for r in list(src) if r["t"] > since]
+            self._send(json.dumps(
+                {"mode": "station" if listening else "band",
+                 "mhz": STATE.get("mhz"),
+                 "span_hz": 2 * SPEC_SPAN,
+                 "lo_hz": BAND_LO, "hi_hz": BAND_HI,
+                 "listening": listening,
+                 "rows": rows[-30:]}))
         elif self.path == "/api/state":
             st = dict(STATE)
             st["survey"] = dict(SURVEY)
