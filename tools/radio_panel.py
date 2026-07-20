@@ -553,6 +553,34 @@ def listen(mhz, prog, name, ifgr=59, rfgain="3", antenna=None):
                     if k in info:
                         STATE[k] = info[k]
         threading.Thread(target=scrape, daemon=True).start()
+
+        def bank_logo():
+            """Logos arrive over ~30-90 s of AAS — too slow for the
+            25 s scan probe, free while actually listening. File the
+            smallest image into the guide so the grid fills in
+            organically as stations get played."""
+            time.sleep(45)
+            if GEN[0] != my_gen:
+                return
+            try:
+                imgs = sorted(list(aas.glob("*.png"))
+                              + list(aas.glob("*.jp*g")),
+                              key=lambda p: p.stat().st_size)
+                if not imgs:
+                    return
+                gdir = LAB / "aas_guide" / f"{mhz:.1f}"
+                gdir.mkdir(parents=True, exist_ok=True)
+                dest = gdir / imgs[0].name
+                dest.write_bytes(imgs[0].read_bytes())
+                st = json.loads(STATIONS.read_text(encoding="utf-8"))
+                for s in st["stations"]:
+                    if abs(s["mhz"] - mhz) < 0.05:
+                        s["logo"] = imgs[0].name
+                STATIONS.write_text(json.dumps(st, indent=1),
+                                    encoding="utf-8")
+            except Exception:
+                pass
+        threading.Thread(target=bank_logo, daemon=True).start()
         set_stage(45, "decoder hunting sync")
         nr_t0 = time.time()
         mpv = None
