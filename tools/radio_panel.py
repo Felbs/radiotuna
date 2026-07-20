@@ -69,7 +69,7 @@ STATE = {"mhz": None, "prog": None, "name": None, "listening": False,
          # stats-for-nerds: the knobs, live
          "decoder": None, "pilot_snr_db": None, "audio_snr_db": None,
          "stereo_blend": None, "fm_mode": None, "agc_db": None,
-         "antenna": None}
+         "antenna": None, "ifgr": None, "rfgain": None}
 
 FM_KEYS = ("pilot_snr_db", "audio_snr_db", "stereo_blend", "fm_mode",
            "agc_db")
@@ -249,7 +249,8 @@ def stop_listen():
         GEN[0] += 1
         STATE.update({"listening": False, "mhz": None, "prog": None,
                       "name": None, "sync": False, "stage": "", "pct": 0,
-                      "decoder": None, "antenna": None})
+                      "decoder": None, "antenna": None, "ifgr": None,
+                      "rfgain": None})
         STATE.update({k: None for k in FM_KEYS})
     for p in LIVE_PROCS:
         try:
@@ -429,6 +430,7 @@ def _cal_gains(mhz, ifgr, rfgain):
 
 def listen(mhz, prog, name, ifgr=59, rfgain="3"):
     ifgr, rfgain = _cal_gains(mhz, ifgr, rfgain)
+    STATE["ifgr"], STATE["rfgain"] = ifgr, str(rfgain)
     stop_listen()
     time.sleep(1)
     with LOCK:
@@ -575,6 +577,7 @@ def listen_fm(mhz, name, ifgr=59, rfgain="3"):
                       "mer_lo": None, "mer_hi": None, "ber": None,
                       "decoder": "fm_stereo v2 (blend)"})
     set_stage(15, "opening the radio (analog FM)")
+    STATE["ifgr"], STATE["rfgain"] = ifgr, str(rfgain)
 
     def worker():
         sdr = st = None
@@ -821,7 +824,11 @@ else if(!s.survey||!s.survey.running){pb.style.display='none';
 if(s.listening&&s.pct===100)document.getElementById('status').textContent='';}
 drawDial(s.mhz);
 let ng=ncard('DECODER',s.decoder||'idle');
-if(s.antenna)ng+=ncard('ANTENNA (auto)',s.antenna);
+if(s.antenna)ng+=ncard('ANTENNA (auto)',s.antenna+' ['+
+(s.hour_band||'?')+' table]');
+if(s.ifgr!=null)ng+=ncard('GAIN IN USE','IFGR '+s.ifgr+' / RF '+s.rfgain);
+ng+=ncard('RADIO LOCK',s.lock?(s.lock.owner+': '+
+(s.lock.purpose||'')):'free');
 if(s.pilot_snr_db!=null){
 ng+=ncard('19K PILOT SNR',s.pilot_snr_db+' dB',s.pilot_snr_db/40*100);
 ng+=ncard('AUDIO SNR',s.audio_snr_db+' dB',s.audio_snr_db/50*100);
@@ -892,6 +899,13 @@ class H(BaseHTTPRequestHandler):
             st = dict(STATE)
             st["survey"] = dict(SURVEY)
             st["daylab"] = daylab_line()
+            h = time.gmtime().tm_hour
+            st["hour_band"] = "day" if 11 <= h < 19 else "evening"
+            try:
+                import radio_lock
+                st["lock"] = radio_lock.status()
+            except Exception:
+                st["lock"] = None
             try:
                 st["stations"] = json.loads(
                     STATIONS.read_text(encoding="utf-8"))["stations"]
