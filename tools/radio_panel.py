@@ -489,7 +489,7 @@ def listen(mhz, prog, name, ifgr=59, rfgain="3", antenna=None):
         GEN[0] += 1
         my_gen = GEN[0]
         STATE.update({"mhz": mhz, "prog": prog, "name": name,
-                      "listening": True, "sync": False,
+                      "listening": True, "sync": False, "audio": None,
                       "title": None, "artist": None})
 
     set_stage(8, "warming the tubes â€” opening the radio")
@@ -673,7 +673,7 @@ def listen_fm(mhz, name, ifgr=59, rfgain="3", antenna=None):
         GEN[0] += 1
         my_gen = GEN[0]
         STATE.update({"mhz": mhz, "prog": None, "name": name + " (analog)",
-                      "listening": True, "sync": False,
+                      "listening": True, "sync": False, "audio": None,
                       "title": name, "artist": "analog FM â€” stereo v2",
                       "mer_lo": None, "mer_hi": None, "ber": None,
                       "decoder": "fm_stereo v2 (blend)"})
@@ -760,6 +760,7 @@ def listen_fm(mhz, name, ifgr=59, rfgain="3", antenna=None):
                         pass
         threading.Thread(target=sdr_reader, daemon=True).start()
         last_hb = time.time()
+        t_open = time.time()
         while GEN[0] == my_gen:
             if time.time() - last_hb > 20:
                 try:
@@ -768,6 +769,19 @@ def listen_fm(mhz, name, ifgr=59, rfgain="3", antenna=None):
                 except Exception:
                     pass
                 last_hb = time.time()
+            # honesty gate: if after settling the pilot is buried, this
+            # analog is NOISE — say so and stop rather than playing hiss
+            # at the human (half the scan's HD finds are 50-mile DC
+            # stations whose analog is unlistenable here; their failed
+            # HD used to "fall back" into pure static)
+            if time.time() - t_open > 6 and mpv is None:
+                p_snr = STATE.get("pilot_snr_db")
+                if p_snr is not None and p_snr < 7:
+                    set_stage(0, f"{mhz:.1f} is out of reach here "
+                                 f"(analog pilot {p_snr:.0f} dB) — "
+                                 f"pick a station with a green grade")
+                    STATE.update({"listening": False})
+                    break
             try:
                 chunk = iq_q.get(timeout=1.0)
             except queue.Empty:
