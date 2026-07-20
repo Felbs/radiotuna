@@ -583,7 +583,15 @@ def listen(mhz, prog, name, ifgr=59, rfgain="3", antenna=None):
         threading.Thread(target=audio_watch,
                          args=(my_gen, wav, on_static),
                          daemon=True).start()
+        last_hb = time.time()
         while GEN[0] == my_gen:
+            if time.time() - last_hb > 20:
+                try:
+                    import radio_lock
+                    radio_lock.heartbeat()
+                except Exception:
+                    pass
+                last_hb = time.time()
             r = sdr.readStream(st, [buf], 65536, timeoutUs=500000)
             if r.ret > 0:
                 n = r.ret - (r.ret & 1)      # keep I/Q pairing even
@@ -606,7 +614,10 @@ def listen(mhz, prog, name, ifgr=59, rfgain="3", antenna=None):
                 threading.Thread(target=listen_fm, args=(mhz, name),
                                  daemon=True).start()
                 return
-            if mpv is None and wav.exists() and wav.stat().st_size > 400_000:
+            if mpv is None and STATE.get("sync") \
+                    and wav.exists() and wav.stat().st_size > 400_000:
+                # gate audio on SYNC: pre-sync HD "audio" is static, and
+                # nobody should hear 15 s of it before the fallback fires
                 set_stage(88, "buffering audio")
                 mpv = subprocess.Popen(
                     [MPV, str(wav), "--volume=100", "--keep-open=yes",
@@ -671,6 +682,39 @@ def listen_fm(mhz, name, ifgr=59, rfgain="3", antenna=None):
         fh.write(fm_stereo.wav_header(fm_stereo.FS_AUDIO, 2))
         fh.flush()
         dem = fm_stereo.FMStereo()
+        dem.tap_secs = 10.0            # live RDS reads the composite
+
+        def rds_watch():
+            """Every ~12 s decode RDS from the composite tap: station
+            name (PS) + RadioText (= now-playing for analog FM)."""
+            import rds as rdsmod
+            time.sleep(14)
+            while GEN[0] == my_gen:
+                try:
+                    if dem.tap:
+                        mpx = np.concatenate(dem.tap)
+                        rec, dfs = rdsmod.costas_bpsk(mpx, fm_stereo.FSC)
+                        best = {"groups": 0}
+                        for sgn in (rec, -rec):
+                            bits = rdsmod.bits_from_symbols(sgn, dfs)
+                            for fl in (bits, bits ^ 1):
+                                g = rdsmod.find_blocks(fl)
+                                if len(g) > best["groups"]:
+                                    best = rdsmod.decode_groups(g)
+                        if best["groups"] > 2 and GEN[0] == my_gen:
+                            ps = best.get("ps") or ""
+                            rt = best.get("rt") or ""
+                            if rt:
+                                STATE["title"] = rt
+                            if ps:
+                                STATE["artist"] = (f"{ps} · RDS"
+                                                   + (f" · {best['pty']}"
+                                                      if best.get("pty")
+                                                      else ""))
+                except Exception:
+                    pass
+                time.sleep(12)
+        threading.Thread(target=rds_watch, daemon=True).start()
         mpv = None
         t0 = time.time()
         # reader thread does NOTHING but big-gulp reads (the starvation
@@ -687,7 +731,15 @@ def listen_fm(mhz, name, ifgr=59, rfgain="3", antenna=None):
                     except queue.Full:
                         pass
         threading.Thread(target=sdr_reader, daemon=True).start()
+        last_hb = time.time()
         while GEN[0] == my_gen:
+            if time.time() - last_hb > 20:
+                try:
+                    import radio_lock
+                    radio_lock.heartbeat()
+                except Exception:
+                    pass
+                last_hb = time.time()
             try:
                 chunk = iq_q.get(timeout=1.0)
             except queue.Empty:

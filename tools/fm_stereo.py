@@ -102,6 +102,11 @@ class FMStereo:
         self.blend = 0.0
         self.snr_ema = None
         self.tele = {}
+        # optional composite tap: a consumer (live RDS decoding) sets
+        # tap_secs > 0 and reads self.tap (float32 chunks @ FSC)
+        self.tap_secs = 0.0
+        self.tap = []
+        self._tap_n = 0
 
     def feed(self, raw_cs16):
         x = (raw_cs16[0::2].astype(np.float64)
@@ -121,6 +126,12 @@ class FMStereo:
         self.prev = xc[-1]
         c = np.angle(xd[1:] * np.conj(xd[:-1]))
         n = len(c)
+        if self.tap_secs > 0:
+            self.tap.append(c.astype(np.float32))
+            self._tap_n += n
+            while self.tap and \
+                    self._tap_n - len(self.tap[0]) > self.tap_secs * FSC:
+                self._tap_n -= len(self.tap.pop(0))
 
         # pilot + noise probes (phase-continuous mixers)
         w19 = 2 * np.pi * F_PILOT / FSC
