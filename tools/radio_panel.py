@@ -83,6 +83,53 @@ STATE = {"mhz": None, "prog": None, "name": None, "listening": False,
          "album": None, "genre": None, "message": None, "tower": None,
          "alert": None}
 
+# ── live spectrum + waterfall ────────────────────────────────────────
+# The listen paths stash raw cs16 chunks here (throttled, copy only);
+# a separate worker does the FFT so the SDR hot loops never pay for it
+# (the don't-hammer-the-chain law). ±250 kHz around the dial: the
+# station, its HD sidebands, and the neighbors.
+import collections as _collections
+SPEC = {"pend": None, "last": 0.0,
+        "rows": _collections.deque(maxlen=60)}
+SPEC_SPAN = 250e3
+
+
+def spec_feed(chunk):
+    now = time.time()
+    if now - SPEC["last"] < 0.15:
+        return
+    SPEC["last"] = now
+    SPEC["pend"] = chunk.copy()
+
+
+def _spec_worker():
+    N = 2048
+    win = np.hanning(N).astype(np.float32)
+    while True:
+        time.sleep(0.12)
+        c = SPEC["pend"]
+        if c is None:
+            continue
+        SPEC["pend"] = None
+        try:
+            x = c[0::2].astype(np.float32) + 1j * c[1::2].astype(np.float32)
+            nseg = min(6, len(x) // N)
+            if nseg < 1:
+                continue
+            p = (np.abs(np.fft.fft(x[:nseg * N].reshape(-1, N) * win,
+                                   axis=1)) ** 2).mean(0)
+            db = 10 * np.log10(np.fft.fftshift(p) + 1e-6)
+            half = int(SPEC_SPAN / (FS_CAP / N))
+            mid = N // 2
+            SPEC["rows"].append(
+                {"t": round(time.time(), 3),
+                 "db": np.round(db[mid - half:mid + half], 1).tolist()})
+        except Exception:
+            pass
+
+
+threading.Thread(target=_spec_worker, daemon=True).start()
+
 FM_KEYS = ("pilot_snr_db", "audio_snr_db", "stereo_blend", "fm_mode",
            "agc_db")
 
@@ -711,6 +758,7 @@ def listen(mhz, prog, name, ifgr=59, rfgain="3", antenna=None):
                     q.put_nowait(buf[:2 * n].copy())
                 except queue.Full:
                     pass                     # decoder hopeless behind; skip
+                spec_feed(buf[:2 * n])       # throttled copy, FFT elsewhere
             if STATE.get("sync") and STATE["pct"] < 70:
                 set_stage(70, "SYNC â€” decoding digital audio")
                 t_sync = time.time()
@@ -897,17 +945,25 @@ def listen_fm(mhz, name, ifgr=59, rfgain="3", antenna=None):
             # stations whose analog is unlistenable here; their failed
             # HD used to "fall back" into pure static)
             if time.time() - t_open > 6 and mpv is None:
+                # MONO stations have no 19 kHz pilot at all (105.9 WMAL
+                # talk, 7/20): pilot-only gating called a strong mono
+                # analog "out of reach". Noise = BOTH dials low; a mono
+                # program keeps audio_snr high with pilot buried.
                 p_snr = STATE.get("pilot_snr_db")
-                if p_snr is not None and p_snr < 7:
+                a_snr = STATE.get("audio_snr_db")
+                if (p_snr is not None and p_snr < 7
+                        and (a_snr is None or a_snr < 12)):
                     set_stage(0, f"{mhz:.1f} is out of reach here "
-                                 f"(analog pilot {p_snr:.0f} dB) — "
-                                 f"pick a station with a green grade")
+                                 f"(pilot {p_snr:.0f} dB, audio "
+                                 f"{a_snr if a_snr is not None else '?'} dB)"
+                                 f" — pick a station with a green grade")
                     STATE.update({"listening": False})
                     break
             try:
                 chunk = iq_q.get(timeout=1.0)
             except queue.Empty:
                 continue
+            spec_feed(chunk)                 # throttled copy, FFT elsewhere
             pcm, tele = dem.feed(decimate2(chunk))
             if len(pcm):
                 fh.write(pcm.tobytes())
@@ -916,7 +972,8 @@ def listen_fm(mhz, name, ifgr=59, rfgain="3", antenna=None):
                 if k in tele:
                     STATE[k] = tele[k]
             if mpv is None and time.time() - t0 > 2.5 \
-                    and (STATE.get("pilot_snr_db") or -99) >= 7:
+                    and ((STATE.get("pilot_snr_db") or -99) >= 7
+                         or (STATE.get("audio_snr_db") or -99) >= 12):
                 mpv = subprocess.Popen(
                     [MPV, str(wav), "--volume=100", "--keep-open=yes",
                      "--force-seekable=yes",
@@ -1038,6 +1095,15 @@ border-radius:6px;border:1px solid rgba(0,229,255,.35)">
 <div><span class="t">welcome</span><br>
 <span class="a">survey the band, then click a program</span></div></div>
 <div id="dial"><canvas id="dialc" width="1880" height="120"></canvas></div>
+<div id="specbox" style="display:none;background:#02040a;border:1px solid
+rgba(0,229,255,.35);border-radius:6px;margin:10px 0;padding:8px">
+ <div style="font-size:10px;color:#3f6a78;letter-spacing:2px">
+ LIVE SPECTRUM &middot; &plusmn;250 kHz AROUND THE DIAL</div>
+ <canvas id="specline" width="688" height="80"
+  style="width:100%;height:80px;display:block"></canvas>
+ <canvas id="wfall" width="688" height="150"
+  style="width:100%;height:150px;display:block;margin-top:2px"></canvas>
+</div>
 <div class="meters">
  <div class="meter" id="hdqbox" style="display:none;min-width:150px">
   <div class="k">HD QUALITY</div><div class="v" id="hdq">&mdash;</div>
@@ -1064,6 +1130,55 @@ border-radius:6px;border:1px solid rgba(0,229,255,.35)">
 <div id="guide">loading the guide&hellip;</div>
 </div><script>
 let stations=[];
+// ── live spectrum + waterfall ──────────────────────────────────────
+let specT=0,specLo=null,specHi=null;
+const wfPal=(()=>{const p=[];for(let i=0;i<256;i++){const v=i/255;
+let r,g,b;if(v<.35){r=3+v*40;g=8+v*90;b=20+v*380}
+else if(v<.7){const u=(v-.35)/.35;r=17+u*0;g=40+u*189;b=153+u*102}
+else{const u=(v-.7)/.3;r=0+u*255;g=229-u*186;b=255-u*41}
+p.push([Math.min(255,r|0),Math.min(255,g|0),Math.min(255,b|0)])}
+return p})();
+function drawSpecRows(rows){
+const line=document.getElementById('specline'),lg=line.getContext('2d');
+const wf=document.getElementById('wfall'),wg=wf.getContext('2d');
+for(const row of rows){const db=row.db,n=db.length;
+let lo=Infinity,hi=-Infinity;
+for(const v of db){if(v<lo)lo=v;if(v>hi)hi=v}
+specLo=specLo===null?lo:specLo*.95+lo*.05;
+specHi=specHi===null?hi:specHi*.95+hi*.05;
+const rng=Math.max(specHi-specLo,10);
+// waterfall: scroll down 1px, paint newest row on top
+wg.drawImage(wf,0,0,wf.width,wf.height-1,0,1,wf.width,wf.height-1);
+const img=wg.createImageData(wf.width,1);
+for(let x=0;x<wf.width;x++){const bin=Math.floor(x*n/wf.width);
+const v=Math.max(0,Math.min(1,(db[bin]-specLo)/rng));
+const c=wfPal[(v*255)|0];const o=x*4;
+img.data[o]=c[0];img.data[o+1]=c[1];img.data[o+2]=c[2];
+img.data[o+3]=255}
+wg.putImageData(img,0,0)}
+// line graph: newest row only, cyan glow, magenta center mark
+const db=rows[rows.length-1].db,n=db.length;
+const rng=Math.max(specHi-specLo,10);
+lg.fillStyle='#02040a';lg.fillRect(0,0,line.width,line.height);
+lg.strokeStyle='rgba(255,43,214,.45)';lg.beginPath();
+lg.moveTo(line.width/2,0);lg.lineTo(line.width/2,line.height);lg.stroke();
+lg.strokeStyle='#00e5ff';lg.shadowColor='#00e5ff';lg.shadowBlur=7;
+lg.beginPath();
+for(let x=0;x<line.width;x++){const bin=Math.floor(x*n/line.width);
+const v=Math.max(0,Math.min(1,(db[bin]-specLo)/rng));
+const y=line.height-3-v*(line.height-8);
+if(x===0)lg.moveTo(x,y);else lg.lineTo(x,y)}
+lg.stroke();lg.shadowBlur=0}
+async function specPoll(){try{
+const r=await(await fetch('/api/spectrum?since='+specT)).json();
+const rows=r.rows||[];
+const box=document.getElementById('specbox');
+if(rows.length){specT=rows[rows.length-1].t;
+box.style.display='block';drawSpecRows(rows)}
+else if(!r.listening){box.style.display='none';specLo=specHi=null}
+}catch(e){}
+setTimeout(specPoll,350)}
+specPoll();
 async function survey(){document.getElementById('status').textContent=
 'surveying: sweeps the band, probes each strong station for HD (~4 min)';
 await fetch('/api/survey',{method:'POST'})}
@@ -1304,6 +1419,20 @@ class H(BaseHTTPRequestHandler):
                 self._send(imgs[0].read_bytes(), ctype)
             else:
                 self.send_error(404)
+        elif self.path.startswith("/api/spectrum"):
+            since = 0.0
+            if "since=" in self.path:
+                try:
+                    since = float(self.path.split("since=")[1]
+                                  .split("&")[0])
+                except ValueError:
+                    pass
+            rows = [r for r in list(SPEC["rows"]) if r["t"] > since]
+            self._send(json.dumps({"mhz": STATE.get("mhz"),
+                                   "span_hz": 2 * SPEC_SPAN,
+                                   "listening": bool(
+                                       STATE.get("listening")),
+                                   "rows": rows[-30:]}))
         elif self.path == "/api/state":
             st = dict(STATE)
             st["survey"] = dict(SURVEY)
