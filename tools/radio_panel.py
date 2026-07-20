@@ -793,7 +793,8 @@ def listen_fm(mhz, name, ifgr=59, rfgain="3", antenna=None):
             for k in FM_KEYS:
                 if k in tele:
                     STATE[k] = tele[k]
-            if mpv is None and time.time() - t0 > 2.5:
+            if mpv is None and time.time() - t0 > 2.5 \
+                    and (STATE.get("pilot_snr_db") or -99) >= 7:
                 mpv = subprocess.Popen(
                     [MPV, str(wav), "--volume=100", "--keep-open=yes",
                      "--force-seekable=yes",
