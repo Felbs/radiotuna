@@ -619,6 +619,7 @@ def listen(mhz, prog, name, ifgr=59, rfgain="3", antenna=None):
         set_stage(45, "decoder hunting sync")
         nr_t0 = time.time()
         mpv = None
+        low_mer_since = None
         # LOSSLESS PUMP (2026-07-05): the SDR loop must NEVER block on the
         # decoder's pipe â€” backpressure was stalling reads, dropping
         # samples, and turning clean BER into static audio. Reader only
@@ -664,11 +665,30 @@ def listen(mhz, prog, name, ifgr=59, rfgain="3", antenna=None):
                     pass                     # decoder hopeless behind; skip
             if STATE.get("sync") and STATE["pct"] < 70:
                 set_stage(70, "SYNC â€” decoding digital audio")
-            # honesty + rescue: no sync in 25 s = this station's HD is out
-            # of reach here â€” fall back to analog so a click ends in sound
+                t_sync = time.time()
+            # honesty + rescue, THREE ways a click must not end in noise
+            # or silence (stress-tested 7/20: sync alone is NOT audio):
+            #  (1) no sync in 25 s               -> analog
+            #  (2) synced but no audio in 20 s   -> analog (105.1 hung
+            #      forever at "decoding"; junk syncs at MER -6 too)
+            #  (3) synced but MER below the audio cliff for 12 s ->
+            #      analog (104.1 played garble at MER 8.4)
+            fall = None
             if not STATE.get("sync") and time.time() - nr_t0 > 25:
-                set_stage(30, "no HD sync â€” digital too weak here; "
-                              "switching to analog FMâ€¦")
+                fall = "no HD sync â€” digital too weak here"
+            elif STATE.get("sync") and mpv is None \
+                    and time.time() - nr_t0 > 45:
+                fall = "HD synced but no audio is decoding"
+            elif mpv is None and STATE.get("sync") \
+                    and (STATE.get("mer_lo") or 99) < 9.5:
+                low_mer_since = low_mer_since or time.time()
+                if time.time() - low_mer_since > 12:
+                    fall = (f"HD too close to the cliff here "
+                            f"(MER {STATE.get('mer_lo')})")
+            else:
+                low_mer_since = None
+            if fall:
+                set_stage(30, fall + "; switching to analog FMâ€¦")
                 close_sdr(sdr, st)
                 try:
                     nr.terminate()
@@ -678,9 +698,10 @@ def listen(mhz, prog, name, ifgr=59, rfgain="3", antenna=None):
                                  daemon=True).start()
                 return
             if mpv is None and STATE.get("sync") \
+                    and (STATE.get("mer_lo") or 0) >= 9.5 \
                     and wav.exists() and wav.stat().st_size > 400_000:
-                # gate audio on SYNC: pre-sync HD "audio" is static, and
-                # nobody should hear 15 s of it before the fallback fires
+                # audio gates on SYNC + MER above the cliff + real
+                # audio bytes: sync alone is not audio (stress-tested)
                 set_stage(88, "buffering audio")
                 mpv = subprocess.Popen(
                     [MPV, str(wav), "--volume=100", "--keep-open=yes",
