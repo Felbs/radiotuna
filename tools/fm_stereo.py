@@ -96,6 +96,9 @@ class FMStereo:
         self.zi_des = np.zeros(1, np.float64)
         self.prev = np.complex64(1 + 0j)
         self.agc = 60000.0
+        self.agc_freeze = False    # benches freeze the servo: its slow
+                                   # wobble AMs the audio and reads as a
+                                   # CNR-independent noise floor
         self.blend = 0.0
         self.snr_ema = None
         self.tele = {}
@@ -180,9 +183,10 @@ class FMStereo:
         self.blend += 0.15 * (target - self.blend)
 
         # AGC on the mono core (same feel as v1)
-        r = float(np.sqrt((m_a ** 2).mean())) + 1e-9
-        want = min(max(5500.0 / r, 12000.0), 400000.0)
-        self.agc += 0.06 * (want - self.agc)
+        if not self.agc_freeze:
+            r = float(np.sqrt((m_a ** 2).mean())) + 1e-9
+            want = min(max(5500.0 / r, 12000.0), 400000.0)
+            self.agc += 0.06 * (want - self.agc)
 
         L = np.clip((m_a + self.blend * s_a) * self.agc, -32000, 32000)
         R = np.clip((m_a - self.blend * s_a) * self.agc, -32000, 32000)
