@@ -654,12 +654,35 @@ def run_survey():
         stations = []
         done = 0
         n_hd = 0
+        # probe cache (speedup, 7/20): a strong carrier that proved
+        # non-HD in the last ~20 h doesn't earn a fresh 10 s HD probe
+        # every scan — reuse its verdict unless its RSSI moved. HD
+        # stations ALWAYS re-probe (fresh MER/programs is the guide's
+        # quality currency).
+        prev = {}
+        try:
+            old = json.loads(STATIONS.read_text(encoding="utf-8"))
+            age_h = (time.time() - time.mktime(time.strptime(
+                old["surveyed_at"], "%Y-%m-%dT%H:%M:%S"))) / 3600
+            if age_h < 20:
+                prev = {round(s["mhz"], 1): s for s in old["stations"]}
+        except Exception:
+            pass
         for mhz, rssi in sorted(strong.items()):
             SURVEY["cur_mhz"] = mhz
             SURVEY["line"] = (f"probing {mhz:.1f} MHz for HD "
                               f"({done + 1}/{len(strong)}) - "
                               f"{n_hd} HD found so far")
-            info = hd_probe(mhz)
+            oldent = prev.get(round(mhz, 1))
+            if oldent and not oldent.get("hd") \
+                    and abs((oldent.get("rssi") or -99) - rssi) < 8:
+                info = {k: oldent.get(k) for k in
+                        ("hd", "name", "slogan", "programs", "mer_lo",
+                         "mer_hi", "ber", "genre", "message", "tower")}
+                info["hd"] = False
+                SURVEY["line"] = f"{mhz:.1f}: non-HD (cached verdict)"
+            else:
+                info = hd_probe(mhz)
             done += 1
             if info.get("hd"):
                 n_hd += 1
@@ -893,6 +916,17 @@ def listen(mhz, prog, name, ifgr=59, rfgain="3", antenna=None):
                 try:
                     import radio_lock
                     radio_lock.heartbeat()
+                    why = radio_lock.should_yield()
+                    if why:
+                        # a satellite pass (prio 100) outranks the
+                        # human (80): losing 15 min of music beats
+                        # losing an unrepeatable pass (8:55 PM 7/20
+                        # was lost exactly this way). Full stop so
+                        # no player loops a stale file.
+                        stop_listen()
+                        set_stage(0, f"antenna yielded: {why} — "
+                                     f"retune when the pass ends")
+                        break
                 except Exception:
                     pass
                 last_hb = time.time()
@@ -1081,6 +1115,12 @@ def listen_fm(mhz, name, ifgr=59, rfgain="3", antenna=None):
                 try:
                     import radio_lock
                     radio_lock.heartbeat()
+                    why = radio_lock.should_yield()
+                    if why:
+                        stop_listen()
+                        set_stage(0, f"antenna yielded: {why} — "
+                                     f"retune when the pass ends")
+                        break
                 except Exception:
                     pass
                 last_hb = time.time()
