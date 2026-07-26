@@ -61,7 +61,9 @@ fills as the tools run.
 | `broadcast_guide.py` | ONE page of everything hearable: FM (+HD names), AM, shortwave named against the EiBi schedule |
 | `radio_room.py` | The listening room (`:8645`): every found station clickable, quality-graded audio + truth dials (carrier MER, sideband symmetry, RDS MER) |
 | `radio_panel.py` | **RADIO TUNA** (`:8643`) — the three-deck UI: FM/HD survey (albacore engine), AM deck (scan + live sync-AM + HD-AM), SW deck (EiBi-identified world-band scans + schedule guide) |
-| `am_listen.py` | Live medium-wave listening: offset-tuned carrier-locked sync-AM, growing-audio playback |
+| `am_best.py` | **The mathematically-best AM/SW demodulator**: carrier filter-lock + sideband-diversity MRC + adaptive bandwidth + hum comb + heterodyne excision + Wiener NR, every stage proven by its own selftest (`am_best.py selftest`) |
+| `am_listen.py` | Live medium-wave listening through the best chain, growing-audio playback + live truth dial |
+| `am_db.py` | Per-user AM station database: scrapes the FCC's public AM Query into `lab/` on first use — no station data ships in this repo; your panel fills from your own scans (set `RT_QTH=lat,lon` privately for distance-aware idents) |
 | `hd_radio.py` | HD Radio (NRSC-5) capture / decode / live listen |
 | `sw_listen.py` | One-shot AM/shortwave listen: synchronous detection + hum-notch/Wiener rescue chain |
 | `sync_am.py` | The sync-AM lab: envelope vs synchronous vs sideband-diversity MRC, with selftest proofs |

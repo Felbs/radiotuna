@@ -15,12 +15,14 @@ import sys
 import time
 from pathlib import Path
 
+import json
+
 import numpy as np
 
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
 from hf_knob import open_sdr, grab, FS          # 250 kS/s HF/MW front end
-from sw_listen import synchronous_am            # carrier-locked detector
+import am_best                                  # the best-chain demodulator
 
 LAB = HERE.parent / "lab"
 LAB.mkdir(exist_ok=True)
@@ -39,7 +41,7 @@ def main():
     ap.add_argument("--chunk", type=float, default=6.0)
     args = ap.parse_args()
 
-    from scipy.signal import resample_poly, butter, sosfilt
+    from scipy.signal import resample_poly
     target = args.khz * 1e3
     raw_path = LAB / "am_live.s16"
     raw_path.write_bytes(b"")
@@ -63,31 +65,28 @@ def main():
              f"--title=RADIO TUNA AM - {args.khz:.0f} kHz", str(raw_path)],
             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
-    # slow AGC state that survives across chunks
-    agc = 0.1
-    sos = None
+    # best-chain state (AGC + adaptive bandwidth carry across chunks)
+    state = {}
+    qual_path = LAB / "band_quality.json"
     chunks_done = 0
     try:
         while True:
             iq = grab(sdr, st, args.chunk)
             n = np.arange(len(iq), dtype=np.float64)
             x = iq * np.exp(-2j * np.pi * OFFSET / FS * n)   # target -> DC
-            # channel filter +-6 kHz then down to 25 kS/s
-            x = resample_poly(x, 1, 10).astype(np.complex64)  # 250k -> 25k
+            # channelize 250k -> 20k (am_best's native rate)
+            x = resample_poly(x, 2, 25).astype(np.complex64)
             x = x - np.mean(x)
-            audio = synchronous_am(x, 25_000)
-            # voice-band shape 100 Hz - 5.5 kHz
-            if sos is None:
-                sos = butter(4, [100 / 12_500, 5_500 / 12_500],
-                             btype="band", output="sos")
-            audio = sosfilt(sos, audio).astype(np.float32)
-            audio = resample_poly(audio, AUD, 25_000).astype(np.float32)
-            # slow AGC riding the fades
-            rms = float(np.sqrt(np.mean(audio ** 2)) + 1e-9)
-            agc = 0.9 * agc + 0.1 * rms
-            audio = np.clip(audio * (0.25 / max(agc, 1e-6)), -1, 1)
+            audio, diag = am_best.best_chunk(x, 20_000, state=state)
+            audio = resample_poly(audio, AUD, 20_000).astype(np.float32)
             with open(raw_path, "ab") as f:
-                f.write((audio * 32000).astype(np.int16).tobytes())
+                f.write((np.clip(audio, -1, 1) * 32000).astype(np.int16).tobytes())
+            # the truth dial, for the panel to read
+            diag.update({"deck": "am", "khz": args.khz, "ts": time.time()})
+            try:
+                qual_path.write_text(json.dumps(diag))
+            except OSError:
+                pass
             chunks_done += 1
             if args.play and player is None and chunks_done >= 1:
                 player = spawn_player()

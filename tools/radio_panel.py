@@ -489,30 +489,11 @@ SW_BANDS = {"49m": (5850, 6250), "41m": (7200, 7500), "31m": (9350, 9950),
             "25m": (11550, 12150), "22m": (13550, 13900),
             "19m": (15050, 15850), "16m": (17450, 18000)}
 
-# AM ident: DC-market locals + the clear-channel skywave giants (night).
-# Static seasonal knowledge — labels say which kind of catch it is.
-AM_DB = {
-    570: "WSBN DC sports", 630: "WSBN/WMAL-legacy DC", 730: "WTNT DC",
-    780: "WBBM Chicago (skywave)", 820: "WSHE Frederick — ALL-DIGITAL MA3",
-    980: "WTEM DC sports", 1090: "WBAL Baltimore", 1120: "KMOX St.Louis (skywave)",
-    1160: "KSL Salt Lake (skywave, HD?)", 1220: "WFAX Falls Church",
-    1260: "WRC-legacy DC", 1500: "WFED Federal News 50kW",
-    1580: "WHFS-legacy", 650: "WSM Nashville (skywave)",
-    660: "WFAN NYC (skywave)", 670: "WSCR Chicago (skywave)",
-    700: "WLW Cincinnati (skywave)", 710: "WOR NYC (skywave)",
-    720: "WGN Chicago (skywave)", 750: "WSB Atlanta (skywave)",
-    760: "WJR Detroit (skywave)", 770: "WABC NYC (skywave)",
-    810: "WGY Schenectady (skywave)", 830: "WCCO Minneapolis (skywave)",
-    840: "WHAS Louisville (skywave)", 850: "WKNR/KOA (skywave)",
-    870: "WWL New Orleans (skywave)", 880: "WCBS NYC (skywave)",
-    890: "WLS Chicago (skywave)", 1010: "WINS NYC (skywave)",
-    1020: "KDKA Pittsburgh (skywave)", 1030: "WBZ Boston (skywave)",
-    1040: "WHO Des Moines (skywave)", 1060: "KYW Philadelphia (skywave)",
-    1080: "WTIC Hartford (skywave)", 1100: "WTAM Cleveland (skywave)",
-    1110: "WBT Charlotte (skywave)", 1130: "WBBR NYC (skywave)",
-    1180: "WHAM Rochester (skywave)", 1200: "WOAI San Antonio (skywave)",
-    1210: "WPHT Philadelphia (skywave)",
-}
+# AM ident: NO station list ships in this code. am_db.py scrapes the
+# FCC's public AM Query into lab/am_db.json on first use — every user's
+# panel fills itself from their own scans + their own fetched copy.
+# Set RT_QTH="lat,lon" in the environment (privately) for distance-aware
+# ranking; without it, ranking is by licensed power.
 
 _EIBI_FULL = None      # (khz, a, b, station, lang, tgt, itu, site)
 
@@ -567,14 +548,13 @@ def _eibi_full():
 
 
 def _ident_am(khz):
-    """(name, call, tower-map link) from the built-in AM guide."""
-    name = AM_DB.get(int(round(khz)), "")
-    if not name:
+    """(name, call, tower-map link) from the user's own scraped FCC db."""
+    try:
+        import am_db
+        label, call, link, _n = am_db.lookup(khz)
+        return label, call, link
+    except Exception:
         return "", "", ""
-    call = name.split()[0].split("/")[0]
-    link = (f"https://radio-locator.com/info/{call}-AM"
-            if call.isalpha() and 3 <= len(call) <= 4 else "")
-    return name, call, link
 
 
 def _ident_sw(khz):
@@ -1699,8 +1679,8 @@ rgba(0,229,255,.35);border-radius:6px;margin:10px 0;padding:8px">
 <div style="text-align:center">
  <button class="knob" onclick="survey()">&#x1F4E1; SURVEY THE BAND</button>
  <button class="knob" onclick="stopL()">&#x23F9; STOP</button>
- <button class="knob hot" id="castbtn" onclick="castToggle()">&#x1F50A;
- CAST TO HOUSE</button>
+ <button class="knob hot" id="castbtn" onclick="castToggle('fm')">&#x1F50A;
+ CAST TO WI-FI SPEAKERS</button>
 </div>
 <div id="status"></div>
 <div id="pbar"><div style="width:0%"></div></div>
@@ -1714,9 +1694,12 @@ rgba(0,229,255,.35);border-radius:6px;margin:10px 0;padding:8px">
   <h2>NIGHTWAVE <span style="color:#e8c9a0">·</span> MEDIUM WAVE</h2>
   <div class="sub">530–1700 kHz · K-180WLA loop · carrier-locked synchronous AM</div>
   <div id="am-freq">— kHz</div>
+  <div id="am-quality" style="display:none;text-align:center;font-size:12px;
+    color:#d8b285;margin:-4px 0 8px 0"></div>
   <div style="text-align:center;margin-bottom:8px">
     <button class="ambtn" onclick="amScan()">⌁ SCAN THE BAND</button>
     <button class="ambtn" onclick="bandStop()">■ STOP</button>
+    <button class="ambtn" onclick="castToggle('am')">🔊 CAST TO WI-FI SPEAKERS</button>
     <span id="am-status" style="margin-left:10px;color:#8a6a45"></span>
   </div>
   <div id="am-hdbox">HD-AM: tune a station, then TRY HD — the 820 WSHE catch
@@ -1734,7 +1717,10 @@ rgba(0,229,255,.35);border-radius:6px;margin:10px 0;padding:8px">
   <div style="margin-bottom:8px">
     <button class="swbtn" onclick="swScan()">⌁ SCAN BAND</button>
     <button class="swbtn" onclick="bandStop()">■ STOP</button>
+    <button class="swbtn" onclick="castToggle('sw')">🔊 CAST TO WI-FI SPEAKERS</button>
     <span id="sw-status" style="margin-left:10px;color:#3f7a52"></span>
+    <div id="sw-quality" style="display:none;font-size:12px;color:#a8e8bc;
+      margin-top:6px"></div>
   </div>
   <div id="sw-sched" style="display:none;margin-bottom:10px;padding:10px;
     border:1px dashed rgba(77,255,124,.4);border-radius:6px;font-size:12px"></div>
@@ -1792,9 +1778,25 @@ document.getElementById('sw-bands').innerHTML=SWB.map(b=>
   `<div class="swband${b==='31m'?' on':''}" data-b="${b}" onclick="swBand('${b}')">${b}</div>`).join('');
 function swBand(b){SW_BAND=b;document.querySelectorAll('.swband').forEach(e=>
   e.classList.toggle('on', e.dataset.b===b));}
+function renderQuality(B){
+  const q=B.quality;
+  for(const [dk,id] of [['am','am-quality'],['sw','sw-quality']]){
+    const el=document.getElementById(id);
+    if(q&&q.deck===dk){
+      el.style.display='';
+      el.innerHTML=`TRUTH DIAL · carrier <b>${q.carrier_snr_db} dB</b>`+
+        ` · co-channel ${q.cochannel}`+
+        ` · fades ${(q.fade_frac6*100).toFixed(0)}%`+
+        ` · BW ${(q.cutoff_hz/1000).toFixed(1)} kHz`+
+        (q.hets_hz&&q.hets_hz.length?` · het notched @ ${q.hets_hz.join(', ')} Hz`:'')+
+        ` · sideband tilt ${q.tilt_db>0?'+':''}${q.tilt_db} dB`;
+    } else el.style.display='none';
+  }
+}
 function pollBand(){
   if(CUR_DECK==='fm')return;
   fetch('/api/band').then(r=>r.json()).then(B=>{
+    renderQuality(B);
     if(CUR_DECK==='am'){
       document.getElementById('am-status').textContent=B.scanning?'scanning…':
         (B.am_stations.length? B.am_stations.length+' carriers':'');
@@ -1951,10 +1953,13 @@ async function survey(){document.getElementById('status').textContent=
 await fetch('/api/survey',{method:'POST'})}
 async function stopL(){await fetch('/api/stop',{method:'POST'})}
 let castOn=false;
-async function castToggle(){
-document.getElementById('status').textContent=castOn?
-'stopping whole-house cast...':'grouping the house and starting the stream...';
-await fetch('/api/cast',{method:'POST',body:JSON.stringify({on:!castOn})})}
+async function castToggle(dk){
+const el=document.getElementById(dk==='am'?'am-status':dk==='sw'?'sw-status':'status');
+el.textContent=castOn?
+'stopping speaker cast...':'starting the wi-fi speaker stream...';
+await fetch('/api/cast',{method:'POST',
+body:JSON.stringify({on:!castOn,deck:dk||'fm'})});
+if(dk&&dk!=='fm'){castOn=!castOn;setTimeout(()=>{el.textContent=castOn?'casting to speakers':'';},8000)}}
 function antSel(){return document.getElementById('antsel').value}
 async function listenFM(mhz,name){
 document.getElementById('status').textContent='tuning '+mhz.toFixed(1)+
@@ -2054,7 +2059,7 @@ ng+=ncard('RADIO LOCK',s.lock?(s.lock.owner+': '+
 (s.lock.purpose||'')):'free');
 const cb=document.getElementById('castbtn');
 if(s.cast){cb.style.display='';castOn=!!s.cast.on;
-cb.innerHTML=castOn?'&#x23F9; STOP CAST':'&#x1F50A; CAST TO HOUSE';
+cb.innerHTML=castOn?'&#x23F9; STOP CAST':'&#x1F50A; CAST TO WI-FI SPEAKERS';
 if(castOn)ng+=ncard('CAST',(s.cast.zones||[]).join(', ')||'on');
 else if(s.cast.err)ng+=ncard('CAST',s.cast.err);}
 else{cb.style.display='none';}
@@ -2209,7 +2214,14 @@ class H(BaseHTTPRequestHandler):
                  "cursor_mhz": cursor,
                  "rows": rows[-30:]}))
         elif self.path == "/api/band":
-            self._send(json.dumps(BAND))
+            b = dict(BAND)
+            try:
+                q = json.loads((LAB / "band_quality.json").read_text())
+                if time.time() - q.get("ts", 0) < 120:
+                    b["quality"] = q
+            except (OSError, ValueError):
+                pass
+            self._send(json.dumps(b))
             return
         elif self.path.startswith("/api/sw/sched"):
             from urllib.parse import urlparse, parse_qs
@@ -2307,8 +2319,24 @@ class H(BaseHTTPRequestHandler):
             def do_cast():
                 import cast_local
                 if req.get("on"):
+                    # deck-aware source: FM casts the live decode WAV;
+                    # AM casts the growing sync-AM raw; SW the last catch
+                    deck = req.get("deck") or BAND.get("deck") or "fm"
+                    src = None
                     name = STATE.get("name") or "radio"
-                    st = cast_local.start(f"ALBACORE TUNA RADIO - {name}")
+                    if deck == "am" and BAND.get("khz"):
+                        src = str(LAB / "am_live.s16")
+                        name = f"AM {BAND['khz']:.0f} kHz"
+                    elif deck == "sw" and BAND.get("khz"):
+                        cand = LAB / f"sw_{int(BAND['khz'])}.wav"
+                        if cand.exists():
+                            src = str(cand)
+                            name = f"SW {BAND['khz']:.0f} kHz"
+                    try:
+                        st = cast_local.start(f"RADIO TUNA - {name}",
+                                              source=src)
+                    except TypeError:      # older private cast module
+                        st = cast_local.start(f"RADIO TUNA - {name}")
                     if st.get("on"):
                         # the house runs ~15 s behind the burst buffer;
                         # two copies at an offset is an echo chamber —
