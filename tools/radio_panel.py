@@ -477,6 +477,239 @@ def stop_listen():
                    capture_output=True)
 
 
+# ── AM / SW decks (Radio Tuna unification, 2026-07-26) ────────────────────
+# One radio, three decks: the albacore FM room plus a medium-wave deck and
+# a world-band shortwave deck, all sharing the single-tenant RSPdx through
+# the same stop_listen()/LIVE_PROCS discipline.
+BAND = {"am_stations": [], "sw_stations": [], "sw_band": "31m",
+        "am_hd": None, "deck": None, "khz": None, "scanning": False}
+AM_ANT = os.environ.get("RT_AM_ANTENNA", "Antenna A")   # the K-180WLA loop
+SW_ANT = os.environ.get("RT_SW_ANTENNA", "Antenna A")   # loop covers HF too
+SW_BANDS = {"49m": (5850, 6250), "41m": (7200, 7500), "31m": (9350, 9950),
+            "25m": (11550, 12150), "22m": (13550, 13900),
+            "19m": (15050, 15850), "16m": (17450, 18000)}
+
+# AM ident: DC-market locals + the clear-channel skywave giants (night).
+# Static seasonal knowledge — labels say which kind of catch it is.
+AM_DB = {
+    570: "WSBN DC sports", 630: "WSBN/WMAL-legacy DC", 730: "WTNT DC",
+    780: "WBBM Chicago (skywave)", 820: "WSHE Frederick — ALL-DIGITAL MA3",
+    980: "WTEM DC sports", 1090: "WBAL Baltimore", 1120: "KMOX St.Louis (skywave)",
+    1160: "KSL Salt Lake (skywave, HD?)", 1220: "WFAX Falls Church",
+    1260: "WRC-legacy DC", 1500: "WFED Federal News 50kW",
+    1580: "WHFS-legacy", 650: "WSM Nashville (skywave)",
+    660: "WFAN NYC (skywave)", 670: "WSCR Chicago (skywave)",
+    700: "WLW Cincinnati (skywave)", 710: "WOR NYC (skywave)",
+    720: "WGN Chicago (skywave)", 750: "WSB Atlanta (skywave)",
+    760: "WJR Detroit (skywave)", 770: "WABC NYC (skywave)",
+    810: "WGY Schenectady (skywave)", 830: "WCCO Minneapolis (skywave)",
+    840: "WHAS Louisville (skywave)", 850: "WKNR/KOA (skywave)",
+    870: "WWL New Orleans (skywave)", 880: "WCBS NYC (skywave)",
+    890: "WLS Chicago (skywave)", 1010: "WINS NYC (skywave)",
+    1020: "KDKA Pittsburgh (skywave)", 1030: "WBZ Boston (skywave)",
+    1040: "WHO Des Moines (skywave)", 1060: "KYW Philadelphia (skywave)",
+    1080: "WTIC Hartford (skywave)", 1100: "WTAM Cleveland (skywave)",
+    1110: "WBT Charlotte (skywave)", 1130: "WBBR NYC (skywave)",
+    1180: "WHAM Rochester (skywave)", 1200: "WOAI San Antonio (skywave)",
+    1210: "WPHT Philadelphia (skywave)",
+}
+
+_EIBI_ROWS = None
+
+
+def _ident_am(khz):
+    return AM_DB.get(int(round(khz)), "")
+
+
+def _ident_sw(khz):
+    """Join a carrier against the EiBi worldwide schedule (what's on the
+    air at THIS UTC minute) via broadcast_guide's cached season CSV."""
+    global _EIBI_ROWS
+    try:
+        if _EIBI_ROWS is None:
+            import broadcast_guide as bg
+            bg.fetch_eibi()                       # no-op when cached
+            _EIBI_ROWS = bg.load_eibi()
+        import broadcast_guide as bg
+        hits = bg.on_air_now(_EIBI_ROWS, khz, tol=2.0)
+        if hits:
+            st, lang, tgt = hits[0]
+            extra = f" +{len(hits)-1}" if len(hits) > 1 else ""
+            return f"{st} [{lang}→{tgt}]{extra}"
+    except Exception:
+        pass
+    return ""
+
+
+def _snapshot_scan(center_hz, fs, secs=2.5, antenna=None, step_hz=10e3,
+                   lo_hz=None, hi_hz=None, thresh_db=12.0):
+    """One wideband grab -> carriers on a channel raster (dB over floor).
+    The 7/26 AM-first-light scanner, generalized."""
+    import SoapySDR
+    SoapySDR.SoapySDR_setLogLevel(SoapySDR.SOAPY_SDR_FATAL)
+    d = SoapySDR.Device("driver=sdrplay")
+    d.setSampleRate(SoapySDR.SOAPY_SDR_RX, 0, fs)
+    d.setFrequency(SoapySDR.SOAPY_SDR_RX, 0, center_hz)
+    try:
+        d.setAntenna(SoapySDR.SOAPY_SDR_RX, 0, antenna or AM_ANT)
+    except Exception:
+        pass
+    try:
+        d.setGain(SoapySDR.SOAPY_SDR_RX, 0, "IFGR", 30)
+    except Exception:
+        pass
+    st = d.setupStream(SoapySDR.SOAPY_SDR_RX, "CF32")
+    d.activateStream(st)
+    buf = np.zeros(262144, np.complex64)
+    ch = []
+    t0 = time.time()
+    while time.time() - t0 < secs:
+        r = d.readStream(st, [buf], len(buf), timeoutUs=800000)
+        if r.ret > 0:
+            ch.append(buf[:r.ret].copy())
+    d.deactivateStream(st)
+    d.closeStream(st)
+    x = np.concatenate(ch) if ch else np.zeros(4096, np.complex64)
+    n = min(len(x), 1 << 21)
+    S = np.abs(np.fft.fftshift(np.fft.fft(x[:n] * np.hanning(n)))) ** 2
+    P = 10 * np.log10(S + 1e-20)
+    f = np.fft.fftshift(np.fft.fftfreq(n, 1 / fs)) + center_hz
+    floor = float(np.median(P))
+    out = []
+    lo = lo_hz if lo_hz else center_hz - fs * 0.45
+    hi = hi_hz if hi_hz else center_hz + fs * 0.45
+    k = lo - (lo % step_hz)
+    while k <= hi:
+        m = (f >= k - 2e3) & (f < k + 2e3)
+        if m.any():
+            db = float(P[m].max() - floor)
+            if db > thresh_db:
+                out.append({"khz": round(k / 1e3, 1), "db": round(db, 1)})
+        k += step_hz
+    out.sort(key=lambda s: -s["db"])
+    return out
+
+
+def am_scan():
+    BAND["scanning"] = True
+    try:
+        found = _snapshot_scan(
+            1115e3, 2e6, antenna=AM_ANT, lo_hz=530e3, hi_hz=1700e3)
+        for s in found:
+            s["id"] = _ident_am(s["khz"])
+        BAND["am_stations"] = found
+        (LAB / "am_stations.json").write_text(json.dumps(found))
+    finally:
+        BAND["scanning"] = False
+
+
+def sw_scan(band):
+    BAND["scanning"] = True
+    try:
+        lo, hi = SW_BANDS.get(band, SW_BANDS["31m"])
+        center = (lo + hi) / 2 * 1e3
+        span = (hi - lo) * 1e3 + 100e3
+        fs = max(1e6, min(8e6, span * 1.25))
+        found = _snapshot_scan(
+            center, fs, antenna=SW_ANT, step_hz=5e3,
+            lo_hz=lo * 1e3, hi_hz=hi * 1e3, thresh_db=10.0)
+        for s in found:
+            s["id"] = _ident_sw(s["khz"])       # EiBi: on the air NOW
+        BAND["sw_stations"] = found
+        BAND["sw_band"] = band
+    finally:
+        BAND["scanning"] = False
+
+
+def band_listen(deck, khz):
+    stop_listen()
+    time.sleep(1)
+    with LOCK:
+        BAND["deck"] = deck
+        BAND["khz"] = khz
+        STATE["stage"] = f"{deck.upper()} {khz:g} kHz"
+    if deck == "am":
+        p = subprocess.Popen([PY, str(HERE / "am_listen.py"),
+                              "--khz", str(khz), "--play",
+                              "--antenna", AM_ANT])
+    else:
+        p = subprocess.Popen([PY, str(HERE / "sw_listen.py"),
+                              "--khz", str(int(khz)), "--secs", "60",
+                              "--play"])
+    LIVE_PROCS.append(p)
+
+
+def am_hd_try(khz):
+    """The 7/26-proven pipeline as a button: offset capture -> band filter
+    -> cu8 (the only nrsc5 file dialect that works) -> albacore --am."""
+    def work():
+        BAND["am_hd"] = {"stage": f"capturing 45s @ {khz:g} kHz..."}
+        try:
+            import SoapySDR
+            from scipy.signal import firwin, lfilter
+            SoapySDR.SoapySDR_setLogLevel(SoapySDR.SOAPY_SDR_FATAL)
+            FSC = 2976750.0
+            target = khz * 1e3
+            center = target - 40e3          # DC spike stays out of channel
+            d = SoapySDR.Device("driver=sdrplay")
+            d.setSampleRate(SoapySDR.SOAPY_SDR_RX, 0, FSC)
+            d.setFrequency(SoapySDR.SOAPY_SDR_RX, 0, center)
+            try:
+                d.setAntenna(SoapySDR.SOAPY_SDR_RX, 0, AM_ANT)
+            except Exception:
+                pass
+            try:
+                d.setGain(SoapySDR.SOAPY_SDR_RX, 0, "IFGR", 30)
+            except Exception:
+                pass
+            st = d.setupStream(SoapySDR.SOAPY_SDR_RX, "CF32")
+            d.activateStream(st)
+            buf = np.zeros(262144, np.complex64)
+            ch = []
+            t0 = time.time()
+            while time.time() - t0 < 45:
+                r = d.readStream(st, [buf], len(buf), timeoutUs=800000)
+                if r.ret > 0:
+                    ch.append(buf[:r.ret].copy())
+            d.deactivateStream(st)
+            d.closeStream(st)
+            x = np.concatenate(ch).astype(np.complex64)
+            BAND["am_hd"] = {"stage": "filtering + cu8..."}
+            nn = np.arange(len(x), dtype=np.float64)
+            x = (x * np.exp(-2j * np.pi * (target - center) / FSC * nn)
+                 ).astype(np.complex64)
+            taps = firwin(301, 25e3 / (FSC / 2)).astype(np.float32)
+            x = lfilter(taps, 1, x)[::2]          # -> exactly 1,488,375
+            x = x / (np.abs(x).max() + 1e-12) * 0.85
+            i16i = np.round(np.real(x) * 32767).astype(np.int16)
+            i16q = np.round(np.imag(x) * 32767).astype(np.int16)
+            cu8 = np.empty(2 * len(x), np.uint8)
+            cu8[0::2] = ((i16i.astype(np.int32) >> 8) + 128
+                         ).clip(0, 255).astype(np.uint8)
+            cu8[1::2] = ((i16q.astype(np.int32) >> 8) + 128
+                         ).clip(0, 255).astype(np.uint8)
+            cap = LAB / "am_hd_try.cu8"
+            cu8.tofile(cap)
+            wav = LAB / "am_hd_try.wav"
+            BAND["am_hd"] = {"stage": "albacore --am decoding..."}
+            p = subprocess.run(
+                [NRSC5, "--am", "-r", str(cap), "-o", str(wav), "0"],
+                capture_output=True, text=True, timeout=240)
+            lines = [l for l in (p.stderr or "").splitlines()
+                     if l.strip()][:12]
+            ok = wav.exists() and wav.stat().st_size > 100_000
+            BAND["am_hd"] = {
+                "stage": "done", "hd": ok, "log": lines,
+                "verdict": ("HD DECODED — listen!" if ok else
+                            "no HD sync (WSHE 820 wants MIDDAY - "
+                            "4.3 kW day vs 430 W night)")}
+            if ok:
+                subprocess.Popen([MPV, str(wav), "--volume=100"])
+        except Exception as e:
+            BAND["am_hd"] = {"stage": "error", "verdict": str(e)[:120]}
+    threading.Thread(target=work, daemon=True).start()
+
+
 # â”€â”€ band survey â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 def fm_power_sweep():
     """Wideband FFT hops across 88-108; returns {mhz: rssi_db} at the
@@ -1173,7 +1406,7 @@ def listen_fm(mhz, name, ifgr=59, rfgain="3", antenna=None):
 
 # â”€â”€ the page â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 PAGE = """<!DOCTYPE html><html><head><meta charset="utf-8">
-<title>ALBACORE TUNA RADIO</title><style>
+<title>RADIO TUNA</title><style>
 body{font-family:Consolas,'Lucida Console',monospace;color:#9fd4e0;
 margin:0;padding:18px;min-height:100vh;background:#030509;
 background-image:linear-gradient(rgba(0,229,255,.05) 1px,transparent 1px),
@@ -1249,7 +1482,81 @@ transition:width .6s}
 #daylab{padding:6px 12px;color:#7ab8c8;font-size:11px;
 border-top:1px solid rgba(255,43,214,.2);white-space:nowrap;
 overflow:hidden;text-overflow:ellipsis}
-</style></head><body><div id="cabinet">
+/* ── RADIO TUNA masthead + decks (2026-07-26 unification) ── */
+#masthead{max-width:980px;margin:0 auto 10px;display:flex;align-items:baseline;
+gap:18px;flex-wrap:wrap}
+#masthead .brand{font-size:26px;letter-spacing:5px;color:#e8f6fa;
+text-shadow:0 0 16px rgba(0,229,255,.5)}
+#masthead .brand b{color:#00e5ff}
+.decktabs{display:flex;gap:8px;margin-left:auto}
+.decktab{cursor:pointer;padding:6px 16px;border-radius:6px 6px 0 0;
+font-size:13px;letter-spacing:2px;border:1px solid #23404d;color:#557;
+background:rgba(8,14,22,.8);user-select:none}
+.decktab.fm.on{color:#00e5ff;border-color:rgba(0,229,255,.6);
+text-shadow:0 0 10px rgba(0,229,255,.7)}
+.decktab.am.on{color:#ffb457;border-color:rgba(255,180,87,.6);
+text-shadow:0 0 10px rgba(255,180,87,.7)}
+.decktab.sw.on{color:#4dff7c;border-color:rgba(77,255,124,.6);
+text-shadow:0 0 10px rgba(77,255,124,.7)}
+.deck{display:none}.deck.on{display:block}
+/* AM deck — tube-glow nightwave */
+#cab-am{max-width:980px;margin:0 auto;padding:20px;border-radius:10px;
+background:radial-gradient(ellipse at 50% 0%,rgba(80,40,8,.45),rgba(10,5,2,.95) 70%),#0d0703;
+border:1px solid rgba(255,180,87,.4);
+box-shadow:0 0 26px rgba(255,150,50,.14),inset 0 0 70px rgba(0,0,0,.6);
+color:#e8c9a0;font-family:Consolas,monospace}
+#cab-am h2{margin:0;color:#ffb457;letter-spacing:4px;font-size:20px;
+text-shadow:0 0 14px rgba(255,180,87,.8),0 0 44px rgba(255,120,20,.3)}
+#cab-am .sub{color:#8a6a45}
+#am-freq{font-size:48px;text-align:center;color:#ffcf87;margin:8px 0;
+text-shadow:0 0 22px rgba(255,180,87,.8)}
+#cab-am table{width:100%;border-collapse:collapse;font-size:13px}
+#cab-am th{color:#8a6a45;text-align:left;padding:4px 8px;letter-spacing:1px;
+border-bottom:1px solid rgba(255,180,87,.25)}
+#cab-am td{padding:4px 8px;border-bottom:1px solid rgba(255,180,87,.1)}
+#cab-am tr:hover{background:rgba(255,150,50,.07)}
+.ambtn{cursor:pointer;background:#2a180a;color:#ffcf87;border:1px solid
+rgba(255,180,87,.5);border-radius:5px;padding:4px 12px;font-family:inherit}
+.ambtn:hover{background:#3d2410;box-shadow:0 0 10px rgba(255,150,50,.3)}
+#am-hdbox{margin-top:10px;padding:10px;border:1px dashed rgba(255,180,87,.4);
+border-radius:6px;color:#d8b285;font-size:12px;min-height:20px}
+.ambar{display:inline-block;height:9px;background:linear-gradient(90deg,#7a4a12,#ffb457);
+border-radius:3px;vertical-align:middle}
+/* SW deck — world-band phosphor */
+#cab-sw{max-width:980px;margin:0 auto;padding:20px;border-radius:10px;
+background:linear-gradient(rgba(20,60,30,.12),transparent 40%),#020703;
+border:1px solid rgba(77,255,124,.35);
+box-shadow:0 0 24px rgba(60,255,120,.12),inset 0 0 70px rgba(0,0,0,.6);
+color:#a8e8bc;font-family:Consolas,monospace}
+#cab-sw h2{margin:0;color:#4dff7c;letter-spacing:4px;font-size:20px;
+text-shadow:0 0 14px rgba(77,255,124,.8)}
+#cab-sw .sub{color:#3f7a52}
+#sw-bands{display:flex;gap:6px;flex-wrap:wrap;margin:10px 0}
+.swband{cursor:pointer;padding:5px 12px;border:1px solid rgba(77,255,124,.4);
+border-radius:5px;color:#7fd89a;background:#04140a;font-size:12px;
+letter-spacing:1px}
+.swband.on,.swband:hover{color:#4dff7c;background:#0a2413;
+box-shadow:0 0 10px rgba(77,255,124,.3)}
+#cab-sw table{width:100%;border-collapse:collapse;font-size:13px}
+#cab-sw th{color:#3f7a52;text-align:left;padding:4px 8px;letter-spacing:1px;
+border-bottom:1px solid rgba(77,255,124,.25)}
+#cab-sw td{padding:4px 8px;border-bottom:1px solid rgba(77,255,124,.1)}
+#cab-sw tr:hover{background:rgba(60,255,120,.06)}
+.swbtn{cursor:pointer;background:#06180d;color:#7fffa5;border:1px solid
+rgba(77,255,124,.5);border-radius:5px;padding:4px 12px;font-family:inherit}
+.swbtn:hover{background:#0c2a16;box-shadow:0 0 10px rgba(77,255,124,.3)}
+.swbar{display:inline-block;height:9px;background:linear-gradient(90deg,#14522a,#4dff7c);
+border-radius:3px;vertical-align:middle}
+</style></head><body>
+<div id="masthead">
+  <div class="brand">RADIO <b>TUNA</b></div>
+  <div class="decktabs">
+    <div class="decktab fm on" data-deck="fm" onclick="deck('fm')">FM · ALBACORE</div>
+    <div class="decktab am" data-deck="am" onclick="deck('am')">AM · NIGHTWAVE</div>
+    <div class="decktab sw" data-deck="sw" onclick="deck('sw')">SW · WORLDBAND</div>
+  </div>
+</div>
+<div id="deck-fm" class="deck on"><div id="cabinet">
 <h1>ALBACORE <span class="mag">TUNA</span> RADIO
 <span style="font-size:13px">&#x1F41F;&#x26A1; high definition
 receiver</span></h1>
@@ -1314,7 +1621,99 @@ rgba(0,229,255,.35);border-radius:6px;margin:10px 0;padding:8px">
 <div id="nerdgrid"></div>
 <div id="daylab"></div></details>
 <div id="guide">loading the guide&hellip;</div>
-</div><script>
+</div></div>
+
+<div id="deck-am" class="deck"><div id="cab-am">
+  <h2>NIGHTWAVE <span style="color:#e8c9a0">·</span> MEDIUM WAVE</h2>
+  <div class="sub">530–1700 kHz · K-180WLA loop · carrier-locked synchronous AM</div>
+  <div id="am-freq">— kHz</div>
+  <div style="text-align:center;margin-bottom:8px">
+    <button class="ambtn" onclick="amScan()">⌁ SCAN THE BAND</button>
+    <button class="ambtn" onclick="bandStop()">■ STOP</button>
+    <span id="am-status" style="margin-left:10px;color:#8a6a45"></span>
+  </div>
+  <div id="am-hdbox">HD-AM: tune a station, then TRY HD — the 820 WSHE catch
+    wants midday (4.3 kW day vs 430 W night).</div>
+  <table><thead><tr><th>kHz</th><th>signal</th><th>who's there</th>
+    <th></th><th></th></tr></thead><tbody id="am-rows">
+    <tr><td colspan="5" style="color:#8a6a45">scan to light the dial…</td></tr>
+  </tbody></table>
+</div></div>
+
+<div id="deck-sw" class="deck"><div id="cab-sw">
+  <h2>WORLDBAND <span style="color:#a8e8bc">·</span> SHORTWAVE</h2>
+  <div class="sub">broadcast bands · EiBi schedule join = who's on the air at THIS minute (UTC)</div>
+  <div id="sw-bands"></div>
+  <div style="margin-bottom:8px">
+    <button class="swbtn" onclick="swScan()">⌁ SCAN BAND</button>
+    <button class="swbtn" onclick="bandStop()">■ STOP</button>
+    <span id="sw-status" style="margin-left:10px;color:#3f7a52"></span>
+  </div>
+  <table><thead><tr><th>kHz</th><th>signal</th><th>on air now (EiBi)</th>
+    <th></th></tr></thead><tbody id="sw-rows">
+    <tr><td colspan="4" style="color:#3f7a52">pick a band, scan the world…</td></tr>
+  </tbody></table>
+</div></div>
+
+<script>
+/* ── RADIO TUNA deck switching + AM/SW logic ── */
+let CUR_DECK='fm', SW_BAND='31m';
+function deck(d){CUR_DECK=d;
+  document.querySelectorAll('.deck').forEach(e=>e.classList.remove('on'));
+  document.getElementById('deck-'+d).classList.add('on');
+  document.querySelectorAll('.decktab').forEach(e=>
+    e.classList.toggle('on', e.dataset.deck===d));
+  localStorage.setItem('rt_deck', d);}
+function post(u,b){return fetch(u,{method:'POST',
+  headers:{'Content-Type':'application/json'},body:JSON.stringify(b||{})});}
+function amScan(){post('/api/am/scan');document.getElementById('am-status').textContent='scanning 530–1700…';}
+function swScan(){post('/api/sw/scan',{band:SW_BAND});document.getElementById('sw-status').textContent='scanning '+SW_BAND+'…';}
+function bandStop(){post('/api/stop');}
+function bandListen(dk,khz){post('/api/band/listen',{deck:dk,khz:khz});
+  if(dk==='am')document.getElementById('am-freq').textContent=khz.toFixed(0)+' kHz';}
+function amHD(khz){post('/api/am/hd',{khz:khz});
+  document.getElementById('am-hdbox').textContent='HD-AM: attempting '+khz+' kHz…';}
+const SWB=['49m','41m','31m','25m','22m','19m','16m'];
+document.getElementById('sw-bands').innerHTML=SWB.map(b=>
+  `<div class="swband${b==='31m'?' on':''}" data-b="${b}" onclick="swBand('${b}')">${b}</div>`).join('');
+function swBand(b){SW_BAND=b;document.querySelectorAll('.swband').forEach(e=>
+  e.classList.toggle('on', e.dataset.b===b));}
+function pollBand(){
+  if(CUR_DECK==='fm')return;
+  fetch('/api/band').then(r=>r.json()).then(B=>{
+    if(CUR_DECK==='am'){
+      document.getElementById('am-status').textContent=B.scanning?'scanning…':
+        (B.am_stations.length? B.am_stations.length+' carriers':'');
+      if(B.khz&&B.deck==='am')document.getElementById('am-freq').textContent=(+B.khz).toFixed(0)+' kHz';
+      if(B.am_hd&&B.am_hd.stage){
+        let h='HD-AM: '+B.am_hd.stage+(B.am_hd.verdict?' — '+B.am_hd.verdict:'');
+        if(B.am_hd.log)h+='<br><span style="color:#a8865f;font-size:11px">'+B.am_hd.log.slice(0,4).join('<br>')+'</span>';
+        document.getElementById('am-hdbox').innerHTML=h;}
+      const rows=B.am_stations.map(s=>{
+        const w=Math.min(90,Math.max(4,(s.db-10)*1.6));
+        return `<tr><td><b style="color:#ffcf87">${s.khz.toFixed(0)}</b></td>`+
+        `<td><span class="ambar" style="width:${w}px"></span> ${s.db.toFixed(0)} dB</td>`+
+        `<td style="color:${s.id&&s.id.includes('MA3')?'#ffd700':'#d8b285'}">${s.id||'—'}</td>`+
+        `<td><button class="ambtn" onclick="bandListen('am',${s.khz})">▶ LISTEN</button></td>`+
+        `<td><button class="ambtn" onclick="amHD(${s.khz})">HD?</button></td></tr>`;});
+      if(rows.length)document.getElementById('am-rows').innerHTML=rows.join('');
+    }
+    if(CUR_DECK==='sw'){
+      document.getElementById('sw-status').textContent=B.scanning?'scanning…':
+        (B.sw_stations.length? B.sw_stations.length+' carriers in '+B.sw_band:'');
+      const rows=B.sw_stations.map(s=>{
+        const w=Math.min(90,Math.max(4,(s.db-8)*2));
+        return `<tr><td><b style="color:#7fffa5">${s.khz.toFixed(0)}</b></td>`+
+        `<td><span class="swbar" style="width:${w}px"></span> ${s.db.toFixed(0)} dB</td>`+
+        `<td style="color:#a8e8bc">${s.id||'<span style="color:#3f7a52">unlisted</span>'}</td>`+
+        `<td><button class="swbtn" onclick="bandListen('sw',${s.khz})">▶ LISTEN 60s</button></td></tr>`;});
+      if(rows.length)document.getElementById('sw-rows').innerHTML=rows.join('');
+    }
+  }).catch(()=>{});
+}
+setInterval(pollBand, 2500);
+if(localStorage.getItem('rt_deck'))deck(localStorage.getItem('rt_deck'));
+</script><script>
 let stations=[];
 // ── live spectrum + waterfall ──────────────────────────────────────
 let specT=0,specLo=null,specHi=null;
@@ -1691,6 +2090,9 @@ class H(BaseHTTPRequestHandler):
                  "scanning": bool(SURVEY.get("running")),
                  "cursor_mhz": cursor,
                  "rows": rows[-30:]}))
+        elif self.path == "/api/band":
+            self._send(json.dumps(BAND))
+            return
         elif self.path == "/api/state":
             st = dict(STATE)
             st["survey"] = dict(SURVEY)
@@ -1751,6 +2153,23 @@ class H(BaseHTTPRequestHandler):
                                                         "auto"))),
                              daemon=True).start()
             self._send('"listening"')
+        elif self.path == "/api/am/scan":
+            threading.Thread(target=am_scan, daemon=True).start()
+            self._send('"scanning"')
+        elif self.path == "/api/sw/scan":
+            threading.Thread(target=sw_scan,
+                             args=(req.get("band", "31m"),),
+                             daemon=True).start()
+            self._send('"scanning"')
+        elif self.path == "/api/band/listen":
+            threading.Thread(target=band_listen,
+                             args=(req.get("deck", "am"),
+                                   float(req.get("khz", 820))),
+                             daemon=True).start()
+            self._send('"listening"')
+        elif self.path == "/api/am/hd":
+            am_hd_try(float(req.get("khz", 820)))
+            self._send('"trying"')
         elif self.path == "/api/stop":
             threading.Thread(target=stop_listen, daemon=True).start()
             try:
@@ -1805,4 +2224,4 @@ class H(BaseHTTPRequestHandler):
 
 if __name__ == "__main__":
     print(f"Radio Tuna panel: http://localhost:{PORT}", flush=True)
-    ThreadingHTTPServer(("127.0.0.1", PORT), H).serve_forever()
+    ThreadingHTTPServer((os.environ.get("RADIO_PANEL_BIND", "127.0.0.1"), PORT), H).serve_forever()
