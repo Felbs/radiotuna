@@ -657,6 +657,57 @@ def _snapshot_scan(center_hz, fs, secs=2.5, antenna=None, step_hz=10e3,
     return out
 
 
+def _dx_log(deck, band, stations):
+    """Append every scan to the DX logbook — after enough days the
+    hour-curves say when each band opens (the three-antenna-day move)."""
+    try:
+        ts = int(time.time())
+        with open(LAB / "dx_log.csv", "a", encoding="utf-8") as f:
+            for s in stations:
+                ident = (s.get("id") or "").replace(",", ";")
+                f.write(f"{ts},{deck},{band},{s['khz']:.0f},"
+                        f"{s['db']:.1f},{ident}\n")
+    except OSError:
+        pass
+
+
+def dx_summary():
+    """Logbook -> band-openings-by-hour + best-ever catches."""
+    hours = {}                       # (deck, band) -> {hour: [counts]}
+    best = {}                        # khz -> (db, id, deck)
+    try:
+        with open(LAB / "dx_log.csv", encoding="utf-8") as f:
+            rows = f.read().splitlines()
+    except OSError:
+        return {"hours": {}, "best": []}
+    scans = {}                       # (ts, deck, band) -> count
+    for line in rows:
+        p = line.split(",", 5)
+        if len(p) < 6:
+            continue
+        ts, deck, band, khz, db, ident = p
+        try:
+            ts, khz, db = int(ts), float(khz), float(db)
+        except ValueError:
+            continue
+        scans.setdefault((ts, deck, band), 0)
+        scans[(ts, deck, band)] += 1
+        if khz not in best or db > best[khz][0]:
+            best[khz] = (db, ident, deck)
+    for (ts, deck, band), n in scans.items():
+        h = time.localtime(ts).tm_hour
+        hours.setdefault(f"{deck}:{band}", {}).setdefault(h, []).append(n)
+    curves = {k: {str(h): round(sum(v) / len(v), 1)
+                  for h, v in hs.items()}
+              for k, hs in hours.items()}
+    top = sorted(((db, khz, ident, deck)
+                  for khz, (db, ident, deck) in best.items() if ident),
+                 reverse=True)[:12]
+    return {"hours": curves,
+            "best": [{"khz": k, "db": d, "id": i, "deck": dk}
+                     for d, k, i, dk in top]}
+
+
 def am_scan():
     BAND["scanning"] = True
     try:
@@ -666,6 +717,7 @@ def am_scan():
             s["id"], s["call"], s["link"] = _ident_am(s["khz"])
         BAND["am_stations"] = found
         (LAB / "am_stations.json").write_text(json.dumps(found))
+        _dx_log("am", "MW", found)
     finally:
         BAND["scanning"] = False
 
@@ -685,6 +737,7 @@ def sw_scan(band):
             s["band"] = band
         BAND["sw_stations"] = found
         BAND["sw_band"] = band
+        _dx_log("sw", band, found)
     finally:
         BAND["scanning"] = False
 
@@ -712,6 +765,7 @@ def sw_scan_all():
                 s["id"], s["tx"], s["link"] = _ident_sw(s["khz"])
                 s["band"] = band
             acc.extend(found)
+            _dx_log("sw", band, found)
             BAND["sw_stations"] = sorted(acc, key=lambda s: -s["db"])
     finally:
         BAND["scanning"] = False
@@ -724,14 +778,13 @@ def band_listen(deck, khz):
         BAND["deck"] = deck
         BAND["khz"] = khz
         STATE["stage"] = f"{deck.upper()} {khz:g} kHz"
-    if deck == "am":
-        p = subprocess.Popen([PY, str(HERE / "am_listen.py"),
-                              "--khz", str(khz), "--play",
-                              "--antenna", AM_ANT])
-    else:
-        p = subprocess.Popen([PY, str(HERE / "sw_listen.py"),
-                              "--khz", str(int(khz)), "--secs", "30",
-                              "--antenna", SW_ANT, "--play"])
+    # one LIVE loop for both decks: continuous best-chain audio +
+    # truth dial + waterfall rows (sw_listen's 30 s batch is retired
+    # from the panel - 30 silent seconds read as "it never played")
+    ant = AM_ANT if deck == "am" else SW_ANT
+    p = subprocess.Popen([PY, str(HERE / "am_listen.py"),
+                          "--khz", str(khz), "--deck", deck,
+                          "--antenna", ant, "--play"])
     LIVE_PROCS.append(p)
 
 
@@ -1725,12 +1778,18 @@ rgba(0,229,255,.35);border-radius:6px;margin:10px 0;padding:8px">
   <div id="am-freq">— kHz</div>
   <div id="am-quality" style="display:none;text-align:center;font-size:12px;
     color:#d8b285;margin:-4px 0 8px 0"></div>
+  <canvas id="am-wf" width="384" height="90" style="display:none;width:100%;
+    max-width:700px;margin:0 auto 8px;border:1px solid rgba(255,180,87,.25);
+    border-radius:4px;image-rendering:pixelated"></canvas>
   <div style="text-align:center;margin-bottom:8px">
     <button class="ambtn" onclick="amScan()">⌁ SCAN THE BAND</button>
     <button class="ambtn" onclick="bandStop()">■ STOP</button>
     <button class="ambtn" onclick="castToggle('am')">🔊 CAST TO WI-FI SPEAKERS</button>
+    <button class="ambtn" onclick="dxLog('am')">📖 DX LOG</button>
     <span id="am-status" style="margin-left:10px;color:#8a6a45"></span>
   </div>
+  <div id="am-dx" style="display:none;margin-bottom:10px;padding:10px;
+    border:1px dashed rgba(255,180,87,.4);border-radius:6px;font-size:12px"></div>
   <div id="am-hdbox">HD-AM: tune a station, then TRY HD — the 820 WSHE catch
     wants midday (4.3 kW day vs 430 W night).</div>
   <table><thead><tr><th>kHz</th><th>signal</th><th>who's there</th>
@@ -1748,9 +1807,15 @@ rgba(0,229,255,.35);border-radius:6px;margin:10px 0;padding:8px">
     <button class="swbtn" onclick="swScanAll()" style="font-weight:bold">🌍 SCAN ALL BANDS</button>
     <button class="swbtn" onclick="bandStop()">■ STOP</button>
     <button class="swbtn" onclick="castToggle('sw')">🔊 CAST TO WI-FI SPEAKERS</button>
+    <button class="swbtn" onclick="dxLog('sw')">📖 DX LOG</button>
     <span id="sw-status" style="margin-left:10px;color:#3f7a52"></span>
     <div id="sw-quality" style="display:none;font-size:12px;color:#a8e8bc;
       margin-top:6px"></div>
+    <canvas id="sw-wf" width="384" height="90" style="display:none;width:100%;
+      max-width:700px;margin:6px auto;border:1px solid rgba(77,255,124,.25);
+      border-radius:4px;image-rendering:pixelated"></canvas>
+    <div id="sw-dx" style="display:none;margin-top:8px;padding:10px;
+      border:1px dashed rgba(77,255,124,.4);border-radius:6px;font-size:12px"></div>
   </div>
   <div id="sw-sched" style="display:none;margin-bottom:10px;padding:10px;
     border:1px dashed rgba(77,255,124,.4);border-radius:6px;font-size:12px"></div>
@@ -1777,6 +1842,8 @@ function swScanAll(){post('/api/sw/scan_all');
   document.getElementById('sw-status').textContent='world tour: sweeping 49m→16m…';}
 function bandStop(){post('/api/stop');}
 function bandListen(dk,khz){post('/api/band/listen',{deck:dk,khz:khz});
+  document.getElementById(dk+'-status').textContent=
+    'tuning '+khz.toFixed(0)+' kHz — audio in ~8 s…';
   if(dk==='am')document.getElementById('am-freq').textContent=khz.toFixed(0)+' kHz';}
 function amHD(khz){post('/api/am/hd',{khz:khz});
   document.getElementById('am-hdbox').textContent='HD-AM: attempting '+khz+' kHz…';}
@@ -1810,6 +1877,29 @@ document.getElementById('sw-bands').innerHTML=SWB.map(b=>
   `<div class="swband${b==='31m'?' on':''}" data-b="${b}" onclick="swBand('${b}')">${b}</div>`).join('');
 function swBand(b){SW_BAND=b;document.querySelectorAll('.swband').forEach(e=>
   e.classList.toggle('on', e.dataset.b===b));}
+const _wfLast={am:0,sw:0};
+function drawBandWF(dk,q){
+  const cv=document.getElementById(dk+'-wf');
+  if(!cv||!q.spec||!q.spec.length)return;
+  cv.style.display='block';
+  if(q.ts<=_wfLast[dk])return;          // one row per fresh chunk
+  _wfLast[dk]=q.ts;
+  const g=cv.getContext('2d');
+  const img=g.getImageData(0,0,cv.width,cv.height);
+  g.putImageData(img,0,6);              // scroll history down
+  const row=g.createImageData(cv.width,6);
+  const amber=v=>[Math.min(255,20+v*1.1),Math.min(255,8+v*0.75),4+v*0.12];
+  const green=v=>[4+v*0.15,Math.min(255,16+v*1.05),8+v*0.35];
+  const pal=dk==='am'?amber:green;
+  const sx=q.spec.length/cv.width;
+  for(let x=0;x<cv.width;x++){
+    const v=q.spec[Math.floor(x*sx)]||0;
+    const [r,gg,b]=pal(v);
+    for(let y=0;y<6;y++){
+      const o=(y*cv.width+x)*4;
+      row.data[o]=r;row.data[o+1]=gg;row.data[o+2]=b;row.data[o+3]=255;}}
+  g.putImageData(row,0,0);
+}
 function renderQuality(B){
   const q=B.quality;
   for(const [dk,id] of [['am','am-quality'],['sw','sw-quality']]){
@@ -1822,15 +1912,48 @@ function renderQuality(B){
         ` · BW ${(q.cutoff_hz/1000).toFixed(1)} kHz`+
         (q.hets_hz&&q.hets_hz.length?` · het notched @ ${q.hets_hz.join(', ')} Hz`:'')+
         ` · sideband tilt ${q.tilt_db>0?'+':''}${q.tilt_db} dB`;
+      drawBandWF(dk,q);
     } else el.style.display='none';
   }
+}
+function dxLog(dk){
+  const box=document.getElementById(dk+'-dx');
+  if(box.style.display==='block'){box.style.display='none';return;}
+  box.style.display='block';
+  box.innerHTML='reading the logbook…';
+  fetch('/api/dx/summary').then(r=>r.json()).then(j=>{
+    const hue=dk==='am'?'#ffcf87':'#7fffa5';
+    let h=`<b style="color:${hue}">📖 DX LOGBOOK — band openings by hour</b>`+
+      `<div style="font-size:11px;margin:2px 0 6px 0;opacity:.7">avg carriers heard per scan, by local hour — fills in as you keep scanning</div>`;
+    const keys=Object.keys(j.hours).filter(k=>k.startsWith(dk+':')).sort();
+    if(!keys.length)h+='<div>no scans logged yet for this deck — every scan from now on is remembered</div>';
+    for(const k of keys){
+      const hs=j.hours[k];
+      const mx=Math.max(1,...Object.values(hs));
+      let cells='';
+      for(let hr=0;hr<24;hr++){
+        const v=hs[hr]||0;
+        const a=v?0.25+0.75*(v/mx):0.06;
+        cells+=`<td title="${hr}:00 — ${v||0} avg" style="width:10px;height:14px;`+
+          `background:${hue};opacity:${a.toFixed(2)}"></td>`;}
+      h+=`<table style="border-spacing:1px;display:inline-table;margin:2px 8px 2px 0">`+
+        `<tr><td style="padding-right:6px;color:${hue}">${k.split(':')[1]}</td>${cells}</tr></table>`;}
+    h+=`<div style="font-size:10px;opacity:.6;margin-top:2px">0h ─ hours (local) ─ 23h</div>`;
+    const best=(j.best||[]).filter(b=>b.deck===dk);
+    if(best.length){
+      h+=`<div style="margin-top:8px"><b style="color:${hue}">best-ever catches</b></div>`;
+      h+=best.map(b=>`<div>${b.khz.toFixed(0)} kHz · ${b.db.toFixed(0)} dB · ${b.id}</div>`).join('');}
+    box.innerHTML=h;
+  }).catch(()=>{box.innerHTML='logbook read failed';});
 }
 function pollBand(){
   if(CUR_DECK==='fm')return;
   fetch('/api/band').then(r=>r.json()).then(B=>{
     renderQuality(B);
     if(CUR_DECK==='am'){
+      const liveAM=B.quality&&B.quality.deck==='am';
       document.getElementById('am-status').textContent=B.scanning?'scanning…':
+        liveAM?('● LIVE '+(+B.khz).toFixed(0)+' kHz'):
         (B.am_stations.length? B.am_stations.length+' carriers':'');
       if(B.khz&&B.deck==='am')document.getElementById('am-freq').textContent=(+B.khz).toFixed(0)+' kHz';
       if(B.am_hd&&B.am_hd.stage){
@@ -1848,8 +1971,10 @@ function pollBand(){
       if(rows.length)document.getElementById('am-rows').innerHTML=rows.join('');
     }
     if(CUR_DECK==='sw'){
+      const liveSW=B.quality&&B.quality.deck==='sw';
       document.getElementById('sw-status').textContent=B.scanning?
         ('scanning '+B.sw_band+'… ('+B.sw_stations.length+' so far)'):
+        liveSW?('● LIVE '+(+B.khz).toFixed(0)+' kHz'):
         (B.sw_stations.length? B.sw_stations.length+' carriers':'');
       if(B.scanning&&B.sw_band){SW_BAND=B.sw_band;
         document.querySelectorAll('.swband').forEach(e=>
@@ -1862,7 +1987,7 @@ function pollBand(){
         `<td><span class="swbar" style="width:${w}px"></span> ${s.db.toFixed(0)} dB</td>`+
         `<td style="color:#a8e8bc">${s.id||'<span style="color:#3f7a52">unlisted</span>'}${lk}`+
         (s.tx?`<br><span style="color:#3f9a5c;font-size:11px">📡 TX: ${s.tx}</span>`:'')+`</td>`+
-        `<td><button class="swbtn" onclick="bandListen('sw',${s.khz})">▶ 30s</button> `+
+        `<td><button class="swbtn" onclick="bandListen('sw',${s.khz})">▶ LISTEN</button> `+
         `<button class="swbtn" onclick="swSched(${s.khz})" title="when to listen — full day schedule">📅</button></td></tr>`;});
       if(rows.length)document.getElementById('sw-rows').innerHTML=rows.join('');
     }
@@ -2254,11 +2379,15 @@ class H(BaseHTTPRequestHandler):
             b = dict(BAND)
             try:
                 q = json.loads((LAB / "band_quality.json").read_text())
-                if time.time() - q.get("ts", 0) < 120:
+                # live loops publish every ~6 s; 20 s = gone means gone
+                if time.time() - q.get("ts", 0) < 20:
                     b["quality"] = q
             except (OSError, ValueError):
                 pass
             self._send(json.dumps(b))
+            return
+        elif self.path == "/api/dx/summary":
+            self._send(json.dumps(dx_summary()))
             return
         elif self.path.startswith("/api/sw/sched"):
             from urllib.parse import urlparse, parse_qs
@@ -2364,14 +2493,9 @@ class H(BaseHTTPRequestHandler):
                     deck = req.get("deck") or BAND.get("deck") or "fm"
                     src = None
                     name = STATE.get("name") or "radio"
-                    if deck == "am" and BAND.get("khz"):
-                        src = str(LAB / "am_live.s16")
-                        name = f"AM {BAND['khz']:.0f} kHz"
-                    elif deck == "sw" and BAND.get("khz"):
-                        cand = LAB / f"sw_{int(BAND['khz'])}.wav"
-                        if cand.exists():
-                            src = str(cand)
-                            name = f"SW {BAND['khz']:.0f} kHz"
+                    if deck in ("am", "sw") and BAND.get("khz"):
+                        src = str(LAB / "band_live.s16")
+                        name = f"{deck.upper()} {BAND['khz']:.0f} kHz"
                     try:
                         st = cast_local.start(f"RADIO TUNA - {name}",
                                               source=src)
