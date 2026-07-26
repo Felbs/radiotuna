@@ -1,14 +1,15 @@
 """am_listen.py - Radio Tuna: LIVE band listening (medium wave AND
 shortwave - one loop for the whole HF world).
 
-Continuous loop: capture a chunk, run the am_best chain (carrier-locked
-sync detection, sideband MRC, adaptive bandwidth, hum comb, het
-excision), append to a growing raw s16 file that mpv tails. Offset-tuned
-so the SDR's DC spike never sits on the carrier (the 7/26 AM-HD lesson).
+Producer/consumer: a capture thread streams the SDR continuously into a
+queue (no samples lost while DSP runs), the main loop runs the am_best
+chain per chunk and feeds audio to mpv over a PIPE. Piping is the law
+learned on FM: a player tailing a growing file pauses forever the
+moment it catches the live edge - "the sound just stopped."
 
-Each chunk also publishes the truth dial + a channel spectrum row to
-lab/band_quality.json - the panel renders the dial and a live waterfall
-from it.
+Every stage (opening SDR, tuning, first capture, audio flowing) is
+published to lab/band_quality.json so the panel can show a loading bar
+that says exactly what it is doing.
 
   python am_listen.py --khz 820 --play              # medium wave
   python am_listen.py --khz 13845 --deck sw --play  # shortwave, same loop
@@ -16,9 +17,11 @@ from it.
 import argparse
 import json
 import os
+import queue
 import shutil
 import subprocess
 import sys
+import threading
 import time
 from pathlib import Path
 
@@ -36,6 +39,16 @@ MPV = (os.environ.get("MPV_EXE") or shutil.which("mpv")
 OFFSET = 30e3            # tune 30 kHz below target; DC stays out of channel
 AUD = 24_000             # output audio rate (plenty for 6 kHz AM)
 SPEC_BINS = 256          # waterfall row width (must divide the 2048 FFT)
+QUAL = LAB / "band_quality.json"
+
+
+def publish(deck, khz, **extra):
+    d = {"deck": deck, "khz": khz, "ts": time.time()}
+    d.update(extra)
+    try:
+        QUAL.write_text(json.dumps(d))
+    except OSError:
+        pass
 
 
 def chan_spectrum(x, lo_pct=10.0):
@@ -66,36 +79,54 @@ def main():
 
     from scipy.signal import resample_poly
     target = args.khz * 1e3
-    raw_path = LAB / "band_live.s16"
+    raw_path = LAB / "band_live.s16"     # kept for the speaker cast
     raw_path.write_bytes(b"")
 
+    publish(args.deck, args.khz, stage="opening the SDR…")
     sdr, st = open_sdr(args.antenna)
     import SoapySDR
+    publish(args.deck, args.khz,
+            stage=f"tuning {args.khz:.0f} kHz on {args.antenna}…")
     sdr.setFrequency(SoapySDR.SOAPY_SDR_RX, 0, target - OFFSET)
     print(f"[band_listen] {args.khz:.0f} kHz ({args.deck}) on "
           f"{args.antenna} (offset-tuned, best chain)", flush=True)
 
-    # player is spawned AFTER the first chunk exists — mpv on an empty raw
-    # file hits instant EOF and exits, which used to kill the whole loop
+    # capture thread: the SDR never waits for the DSP
+    iq_q = queue.Queue(maxsize=4)
+    stop_ev = threading.Event()
+
+    def capture():
+        while not stop_ev.is_set():
+            try:
+                iq_q.put(grab(sdr, st, args.chunk), timeout=2)
+            except queue.Full:
+                try:                     # DSP wedged - drop oldest, go on
+                    iq_q.get_nowait()
+                except queue.Empty:
+                    pass
+            except Exception:
+                return
+    threading.Thread(target=capture, daemon=True).start()
+    publish(args.deck, args.khz,
+            stage=f"capturing first {args.chunk:.0f}s of radio…")
+
     player = None
 
     def spawn_player():
         return subprocess.Popen(
             [MPV, "--demuxer=rawaudio", "--demuxer-rawaudio-rate=%d" % AUD,
              "--demuxer-rawaudio-channels=1", "--demuxer-rawaudio-format=s16le",
-             "--force-seekable=no", "--cache=yes", "--keep-open=yes",
-             "--volume=95",
+             "--cache=yes", "--volume=95",
              f"--title=RADIO TUNA {args.deck.upper()} - {args.khz:.0f} kHz",
-             str(raw_path)],
+             "-"],
+            stdin=subprocess.PIPE,
             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
-    # best-chain state (AGC + adaptive bandwidth carry across chunks)
     state = {}
-    qual_path = LAB / "band_quality.json"
     chunks_done = 0
     try:
         while True:
-            iq = grab(sdr, st, args.chunk)
+            iq = iq_q.get()
             n = np.arange(len(iq), dtype=np.float64)
             x = iq * np.exp(-2j * np.pi * OFFSET / FS * n)   # target -> DC
             # channelize 250k -> 20k (am_best's native rate)
@@ -104,28 +135,38 @@ def main():
             spec = chan_spectrum(x)
             audio, diag = am_best.best_chunk(x, 20_000, state=state)
             audio = resample_poly(audio, AUD, 20_000).astype(np.float32)
+            pcm = (np.clip(audio, -1, 1) * 32000).astype(np.int16).tobytes()
             with open(raw_path, "ab") as f:
-                f.write((np.clip(audio, -1, 1) * 32000).astype(np.int16).tobytes())
+                f.write(pcm)             # the cast tails this file
+            chunks_done += 1
+            if args.play and player is None:
+                player = spawn_player()  # first chunk primes the pipe
+            if player is not None:
+                try:
+                    player.stdin.write(pcm)
+                    player.stdin.flush()
+                except (BrokenPipeError, OSError):
+                    break                # listener closed the window
             # the truth dial + waterfall row, for the panel to read
             diag.update({"deck": args.deck, "khz": args.khz,
                          "ts": time.time(), "spec": spec})
             try:
-                qual_path.write_text(json.dumps(diag))
+                QUAL.write_text(json.dumps(diag))
             except OSError:
                 pass
-            chunks_done += 1
-            if args.play and player is None and chunks_done >= 1:
-                player = spawn_player()
-            if player is not None and player.poll() is not None:
-                break                            # listener closed the window
     except KeyboardInterrupt:
         pass
     finally:
+        stop_ev.set()
         try:
             sdr.deactivateStream(st); sdr.closeStream(st)
         except Exception:
             pass
         if player is not None and player.poll() is None:
+            try:
+                player.stdin.close()
+            except OSError:
+                pass
             player.terminate()
 
 
