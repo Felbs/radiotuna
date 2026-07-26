@@ -1,6 +1,13 @@
-# gr-radiotuna 🐟📻
+# RADIO TUNA 🐟📻
 
-**Adaptive radio decoding — the TV Tuna method, unleashed on every band.**
+**One radio, three decks — FM · AM · Shortwave — adaptive decoding on every band.**
+
+Radio Tuna is the whole-radio project: one web UI (`tools/radio_panel.py`,
+`:8643`) with an FM deck (HD Radio via the [albacore](https://github.com/Felbs/albacore)
+engine, our instrumented nrsc5 fork), an AM deck (medium-wave scan, live
+synchronous-AM listening, HD-AM attempts), and a shortwave deck (world-band
+scans identified live against the EiBi schedule — station, language, target,
+transmitter site, and a full when-to-listen guide per frequency).
 
 Born 2026-07-05 from [Software-TV-Tuner](https://github.com/Felbs/Software-TV-Tuner)
 (TV Tuna), where the method was forged against the hardest teacher in
@@ -27,8 +34,9 @@ anti-regression discipline, and the three-antenna experiment design.
 
 ## Quickstart
 ```bash
-git clone https://github.com/Felbs/gr-radiotuna.git
-cd gr-radiotuna
+git clone https://github.com/Felbs/radiotuna.git
+cd radiotuna
+python tools/radio_panel.py             # http://localhost:8643 - RADIO TUNA, all three decks
 python tools/sync_am.py selftest        # sync-AM + sideband-diversity proofs, no radio
 python tools/ais.py selftest            # AIS encode->decode roundtrip, no radio
 python tools/broadcast_guide.py survey  # live: FM+AM+SW station survey (~1 min)
@@ -39,9 +47,11 @@ python tools/radio_room.py              # http://localhost:8645 - click stations
 bindings + a driver for your SDR. Easiest path is
 [radioconda](https://github.com/ryanvolz/radioconda); on Debian/Ubuntu:
 `apt install python3-numpy python3-scipy python3-numba python3-soapysdr soapysdr-module-all`.
-Optional externals: [`nrsc5`](https://github.com/theori-io/nrsc5) (HD Radio
-decode) and `mpv` (audio playback) — auto-found on PATH, or point
-`NRSC5_EXE` / `MPV_EXE` at them.
+Optional externals: [`albacore`](https://github.com/Felbs/albacore) — our
+instrumented [nrsc5](https://github.com/theori-io/nrsc5) fork and Radio
+Tuna's preferred HD Radio engine (point `ALBACORE_EXE` at it; falls back
+to stock `nrsc5` via `NRSC5_EXE`/PATH) — and `mpv` (audio playback,
+`MPV_EXE`).
 Note: `lab/` (surveys, caches, recordings) is empty on a fresh clone and
 fills as the tools run.
 
@@ -50,7 +60,8 @@ fills as the tools run.
 |---|---|
 | `broadcast_guide.py` | ONE page of everything hearable: FM (+HD names), AM, shortwave named against the EiBi schedule |
 | `radio_room.py` | The listening room (`:8645`): every found station clickable, quality-graded audio + truth dials (carrier MER, sideband symmetry, RDS MER) |
-| `radio_panel.py` | FM/HD survey panel (`:8643`), station-name cache |
+| `radio_panel.py` | **RADIO TUNA** (`:8643`) — the three-deck UI: FM/HD survey (albacore engine), AM deck (scan + live sync-AM + HD-AM), SW deck (EiBi-identified world-band scans + schedule guide) |
+| `am_listen.py` | Live medium-wave listening: offset-tuned carrier-locked sync-AM, growing-audio playback |
 | `hd_radio.py` | HD Radio (NRSC-5) capture / decode / live listen |
 | `sw_listen.py` | One-shot AM/shortwave listen: synchronous detection + hum-notch/Wiener rescue chain |
 | `sync_am.py` | The sync-AM lab: envelope vs synchronous vs sideband-diversity MRC, with selftest proofs |

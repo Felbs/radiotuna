@@ -514,31 +514,108 @@ AM_DB = {
     1210: "WPHT Philadelphia (skywave)",
 }
 
-_EIBI_ROWS = None
+_EIBI_FULL = None      # (khz, a, b, station, lang, tgt, itu, site)
+
+# ITU code -> transmitter country (the common world-band senders)
+ITU_MAP = {"USA": "USA", "CUB": "Cuba", "CHN": "China", "IND": "India",
+           "G": "UK", "F": "France", "D": "Germany", "ROU": "Romania",
+           "TUR": "Turkey", "KOR": "S.Korea", "KRE": "N.Korea",
+           "J": "Japan", "B": "Brazil", "MRA": "N.Marianas",
+           "PHL": "Philippines", "THA": "Thailand", "AUT": "Austria",
+           "E": "Spain", "EGY": "Egypt", "IRN": "Iran", "ARS": "Saudi",
+           "ALB": "Albania", "BOT": "Botswana", "STP": "São Tomé",
+           "MDG": "Madagascar", "UZB": "Uzbekistan", "TJK": "Tajikistan",
+           "GUM": "Guam", "ASC": "Ascension Is.", "CAN": "Canada",
+           "MEX": "Mexico", "NZL": "New Zealand", "AUS": "Australia",
+           "CLN": "Sri Lanka", "SNG": "Singapore", "TWN": "Taiwan",
+           "VTN": "Vietnam", "NIG": "Nigeria", "NOR": "Norway"}
+
+
+def _eibi_full():
+    """Full EiBi rows incl. transmitter ITU country + site remark —
+    the columns broadcast_guide's lean loader drops."""
+    global _EIBI_FULL
+    if _EIBI_FULL is not None:
+        return _EIBI_FULL
+    rows = []
+    try:
+        import broadcast_guide as bg
+        bg.fetch_eibi()
+        txt = bg.EIBI.read_text(encoding="latin-1", errors="replace")
+        for line in txt.splitlines():
+            p = line.split(";")
+            if len(p) < 7:
+                continue
+            try:
+                khz = float(p[0])
+            except ValueError:
+                continue
+            tr = p[1].replace(" ", "")
+            if "-" not in tr:
+                continue
+            try:
+                a, b = tr.split("-")[:2]
+                rows.append((khz, int(a), int(b), p[4].strip(), p[5].strip(),
+                             p[6].strip(), p[3].strip(),
+                             p[7].strip() if len(p) > 7 else ""))
+            except ValueError:
+                continue
+    except Exception:
+        pass
+    _EIBI_FULL = rows
+    return rows
 
 
 def _ident_am(khz):
-    return AM_DB.get(int(round(khz)), "")
+    """(name, call, tower-map link) from the built-in AM guide."""
+    name = AM_DB.get(int(round(khz)), "")
+    if not name:
+        return "", "", ""
+    call = name.split()[0].split("/")[0]
+    link = (f"https://radio-locator.com/info/{call}-AM"
+            if call.isalpha() and 3 <= len(call) <= 4 else "")
+    return name, call, link
 
 
 def _ident_sw(khz):
-    """Join a carrier against the EiBi worldwide schedule (what's on the
-    air at THIS UTC minute) via broadcast_guide's cached season CSV."""
-    global _EIBI_ROWS
-    try:
-        if _EIBI_ROWS is None:
-            import broadcast_guide as bg
-            bg.fetch_eibi()                       # no-op when cached
-            _EIBI_ROWS = bg.load_eibi()
-        import broadcast_guide as bg
-        hits = bg.on_air_now(_EIBI_ROWS, khz, tol=2.0)
-        if hits:
-            st, lang, tgt = hits[0]
-            extra = f" +{len(hits)-1}" if len(hits) > 1 else ""
-            return f"{st} [{lang}→{tgt}]{extra}"
-    except Exception:
-        pass
-    return ""
+    """(now-playing label, tx country, short-wave.info link) via EiBi."""
+    from datetime import datetime, timezone
+    now = datetime.now(timezone.utc)
+    cur = now.hour * 100 + now.minute
+    best = None
+    any_row = None
+    for (f, a, b, st, lang, tgt, itu, site) in _eibi_full():
+        if abs(f - khz) > 2.0:
+            continue
+        any_row = any_row or (st, itu, site)
+        live = (a <= cur < b) if a <= b else (cur >= a or cur < b)
+        if live and best is None:
+            best = (st, lang, tgt, itu, site)
+    link = f"https://short-wave.info/index.php?freq={khz:g}"
+    if best:
+        st, lang, tgt, itu, site = best
+        tx = ITU_MAP.get(itu, itu)
+        if site:
+            tx += f" ({site[:18]})"
+        return f"{st} [{lang}→{tgt}]", tx, link
+    if any_row:
+        st, itu, site = any_row
+        return f"({st} — off-air now)", ITU_MAP.get(itu, itu), link
+    return "", "", link
+
+
+def sw_schedule(khz):
+    """The 'radio guide': every EiBi entry for this frequency — when to
+    listen, who it is, where the transmitter is."""
+    out = []
+    for (f, a, b, st, lang, tgt, itu, site) in _eibi_full():
+        if abs(f - khz) > 2.0:
+            continue
+        out.append({"time": f"{a:04d}-{b:04d} UTC", "station": st,
+                    "lang": lang, "target": tgt,
+                    "tx": ITU_MAP.get(itu, itu) + (f" · {site}" if site else "")})
+    out.sort(key=lambda r: r["time"])
+    return out
 
 
 def _snapshot_scan(center_hz, fs, secs=2.5, antenna=None, step_hz=10e3,
@@ -547,7 +624,17 @@ def _snapshot_scan(center_hz, fs, secs=2.5, antenna=None, step_hz=10e3,
     The 7/26 AM-first-light scanner, generalized."""
     import SoapySDR
     SoapySDR.SoapySDR_setLogLevel(SoapySDR.SOAPY_SDR_FATAL)
-    d = SoapySDR.Device("driver=sdrplay")
+    # single-tenant SDR: a just-stopped listener may still hold the device
+    # for a few seconds — retry instead of silently returning 0 stations
+    d = None
+    for attempt in range(4):
+        try:
+            d = SoapySDR.Device("driver=sdrplay")
+            break
+        except Exception:
+            if attempt == 3:
+                raise
+            time.sleep(2.5)
     d.setSampleRate(SoapySDR.SOAPY_SDR_RX, 0, fs)
     d.setFrequency(SoapySDR.SOAPY_SDR_RX, 0, center_hz)
     try:
@@ -596,7 +683,7 @@ def am_scan():
         found = _snapshot_scan(
             1115e3, 2e6, antenna=AM_ANT, lo_hz=530e3, hi_hz=1700e3)
         for s in found:
-            s["id"] = _ident_am(s["khz"])
+            s["id"], s["call"], s["link"] = _ident_am(s["khz"])
         BAND["am_stations"] = found
         (LAB / "am_stations.json").write_text(json.dumps(found))
     finally:
@@ -614,7 +701,7 @@ def sw_scan(band):
             center, fs, antenna=SW_ANT, step_hz=5e3,
             lo_hz=lo * 1e3, hi_hz=hi * 1e3, thresh_db=10.0)
         for s in found:
-            s["id"] = _ident_sw(s["khz"])       # EiBi: on the air NOW
+            s["id"], s["tx"], s["link"] = _ident_sw(s["khz"])
         BAND["sw_stations"] = found
         BAND["sw_band"] = band
     finally:
@@ -634,8 +721,8 @@ def band_listen(deck, khz):
                               "--antenna", AM_ANT])
     else:
         p = subprocess.Popen([PY, str(HERE / "sw_listen.py"),
-                              "--khz", str(int(khz)), "--secs", "60",
-                              "--play"])
+                              "--khz", str(int(khz)), "--secs", "30",
+                              "--antenna", SW_ANT, "--play"])
     LIVE_PROCS.append(p)
 
 
@@ -1649,6 +1736,8 @@ rgba(0,229,255,.35);border-radius:6px;margin:10px 0;padding:8px">
     <button class="swbtn" onclick="bandStop()">■ STOP</button>
     <span id="sw-status" style="margin-left:10px;color:#3f7a52"></span>
   </div>
+  <div id="sw-sched" style="display:none;margin-bottom:10px;padding:10px;
+    border:1px dashed rgba(77,255,124,.4);border-radius:6px;font-size:12px"></div>
   <table><thead><tr><th>kHz</th><th>signal</th><th>on air now (EiBi)</th>
     <th></th></tr></thead><tbody id="sw-rows">
     <tr><td colspan="4" style="color:#3f7a52">pick a band, scan the world…</td></tr>
@@ -1673,6 +1762,31 @@ function bandListen(dk,khz){post('/api/band/listen',{deck:dk,khz:khz});
   if(dk==='am')document.getElementById('am-freq').textContent=khz.toFixed(0)+' kHz';}
 function amHD(khz){post('/api/am/hd',{khz:khz});
   document.getElementById('am-hdbox').textContent='HD-AM: attempting '+khz+' kHz…';}
+function swSched(khz){
+  const box=document.getElementById('sw-sched');
+  box.style.display='block';
+  box.innerHTML='<span style="color:#3f7a52">loading schedule…</span>';
+  fetch('/api/sw/sched?khz='+khz).then(r=>r.json()).then(j=>{
+    if(!j.sched||!j.sched.length){
+      box.innerHTML=`<b style="color:#7fffa5">${khz.toFixed(0)} kHz</b> — no EiBi entries for this frequency. `+
+        `<span style="color:#3f7a52;cursor:pointer" `+
+        `onclick="document.getElementById('sw-sched').style.display='none'">[close]</span>`;return;}
+    const now=new Date();
+    const utc=now.getUTCHours()*100+now.getUTCMinutes();
+    const rows=j.sched.map(e=>{
+      const m=e.time.match(/(\\d{4})-(\\d{4})/)||['','0000','2400'];
+      const a=+m[1],b=+m[2];
+      const on=(a<=b)?(utc>=a&&utc<b):(utc>=a||utc<b);
+      return `<tr style="${on?'color:#7fffa5;font-weight:bold':'color:#4a8a5f'}">`+
+      `<td>${m[1].slice(0,2)}:${m[1].slice(2)}–${m[2].slice(0,2)}:${m[2].slice(2)} UTC${on?' ●':''}</td>`+
+      `<td>${e.station}</td><td>${e.lang||''}</td><td>${e.target||''}</td>`+
+      `<td style="color:#3f9a5c">${e.tx||''}</td></tr>`;}).join('');
+    box.innerHTML=`<div style="display:flex;justify-content:space-between;margin-bottom:6px">`+
+      `<b style="color:#7fffa5">📅 ${khz.toFixed(0)} kHz — full day (EiBi)</b>`+
+      `<span style="color:#3f7a52;cursor:pointer" onclick="document.getElementById('sw-sched').style.display='none'">[close]</span></div>`+
+      `<table style="width:100%"><thead><tr><th>time</th><th>station</th><th>lang</th><th>target</th><th>transmitter</th></tr></thead>`+
+      `<tbody>${rows}</tbody></table>`;
+  }).catch(()=>{box.innerHTML='schedule fetch failed';});}
 const SWB=['49m','41m','31m','25m','22m','19m','16m'];
 document.getElementById('sw-bands').innerHTML=SWB.map(b=>
   `<div class="swband${b==='31m'?' on':''}" data-b="${b}" onclick="swBand('${b}')">${b}</div>`).join('');
@@ -1691,9 +1805,10 @@ function pollBand(){
         document.getElementById('am-hdbox').innerHTML=h;}
       const rows=B.am_stations.map(s=>{
         const w=Math.min(90,Math.max(4,(s.db-10)*1.6));
+        const lk=s.link?` <a href="${s.link}" target="_blank" title="tower location map (radio-locator)" style="color:#ffb457;text-decoration:none">🗺</a>`:'';
         return `<tr><td><b style="color:#ffcf87">${s.khz.toFixed(0)}</b></td>`+
         `<td><span class="ambar" style="width:${w}px"></span> ${s.db.toFixed(0)} dB</td>`+
-        `<td style="color:${s.id&&s.id.includes('MA3')?'#ffd700':'#d8b285'}">${s.id||'—'}</td>`+
+        `<td style="color:${s.id&&s.id.includes('MA3')?'#ffd700':'#d8b285'}">${s.id||'—'}${lk}</td>`+
         `<td><button class="ambtn" onclick="bandListen('am',${s.khz})">▶ LISTEN</button></td>`+
         `<td><button class="ambtn" onclick="amHD(${s.khz})">HD?</button></td></tr>`;});
       if(rows.length)document.getElementById('am-rows').innerHTML=rows.join('');
@@ -1703,10 +1818,13 @@ function pollBand(){
         (B.sw_stations.length? B.sw_stations.length+' carriers in '+B.sw_band:'');
       const rows=B.sw_stations.map(s=>{
         const w=Math.min(90,Math.max(4,(s.db-8)*2));
+        const lk=s.link?` <a href="${s.link}" target="_blank" title="short-wave.info" style="color:#4dff7c;text-decoration:none">🔗</a>`:'';
         return `<tr><td><b style="color:#7fffa5">${s.khz.toFixed(0)}</b></td>`+
         `<td><span class="swbar" style="width:${w}px"></span> ${s.db.toFixed(0)} dB</td>`+
-        `<td style="color:#a8e8bc">${s.id||'<span style="color:#3f7a52">unlisted</span>'}</td>`+
-        `<td><button class="swbtn" onclick="bandListen('sw',${s.khz})">▶ LISTEN 60s</button></td></tr>`;});
+        `<td style="color:#a8e8bc">${s.id||'<span style="color:#3f7a52">unlisted</span>'}${lk}`+
+        (s.tx?`<br><span style="color:#3f9a5c;font-size:11px">📡 TX: ${s.tx}</span>`:'')+`</td>`+
+        `<td><button class="swbtn" onclick="bandListen('sw',${s.khz})">▶ 30s</button> `+
+        `<button class="swbtn" onclick="swSched(${s.khz})" title="when to listen — full day schedule">📅</button></td></tr>`;});
       if(rows.length)document.getElementById('sw-rows').innerHTML=rows.join('');
     }
   }).catch(()=>{});
@@ -2092,6 +2210,12 @@ class H(BaseHTTPRequestHandler):
                  "rows": rows[-30:]}))
         elif self.path == "/api/band":
             self._send(json.dumps(BAND))
+            return
+        elif self.path.startswith("/api/sw/sched"):
+            from urllib.parse import urlparse, parse_qs
+            q = parse_qs(urlparse(self.path).query)
+            khz = float(q.get("khz", ["0"])[0])
+            self._send(json.dumps({"khz": khz, "sched": sw_schedule(khz)}))
             return
         elif self.path == "/api/state":
             st = dict(STATE)
