@@ -1,21 +1,26 @@
-"""am_listen.py - Radio Tuna AM deck: LIVE medium-wave listening.
+"""am_listen.py - Radio Tuna: LIVE band listening (medium wave AND
+shortwave - one loop for the whole HF world).
 
-Continuous loop: capture a chunk, synchronous-AM demodulate (carrier-locked
-PLL - the FPLL idea on AM, borrowed from sw_listen), append to a growing raw
-s16 file that mpv tails. Offset-tuned so the SDR's DC spike never sits on the
-carrier the PLL locks to (the 7/26 AM-HD lesson).
+Continuous loop: capture a chunk, run the am_best chain (carrier-locked
+sync detection, sideband MRC, adaptive bandwidth, hum comb, het
+excision), append to a growing raw s16 file that mpv tails. Offset-tuned
+so the SDR's DC spike never sits on the carrier (the 7/26 AM-HD lesson).
 
-  python am_listen.py --khz 820 --play
+Each chunk also publishes the truth dial + a channel spectrum row to
+lab/band_quality.json - the panel renders the dial and a live waterfall
+from it.
+
+  python am_listen.py --khz 820 --play              # medium wave
+  python am_listen.py --khz 13845 --deck sw --play  # shortwave, same loop
 """
 import argparse
+import json
 import os
 import shutil
 import subprocess
 import sys
 import time
 from pathlib import Path
-
-import json
 
 import numpy as np
 
@@ -30,27 +35,45 @@ MPV = (os.environ.get("MPV_EXE") or shutil.which("mpv")
        or r"C:\Program Files\MPV Player\mpv.exe")
 OFFSET = 30e3            # tune 30 kHz below target; DC stays out of channel
 AUD = 24_000             # output audio rate (plenty for 6 kHz AM)
+SPEC_BINS = 256          # waterfall row width (must divide the 2048 FFT)
+
+
+def chan_spectrum(x, lo_pct=10.0):
+    """One waterfall row: dB spectrum of the channelized signal, scaled
+    0..255 against its own floor so the panel can palette it."""
+    n = 2048
+    if len(x) < n:
+        return []
+    seg = x[:len(x) // n * n].reshape(-1, n) * np.hanning(n).astype(np.float32)
+    P = (np.abs(np.fft.fftshift(np.fft.fft(seg, axis=1), axes=1)) ** 2).mean(axis=0)
+    P = 10 * np.log10(P + 1e-15)
+    P = P.reshape(SPEC_BINS, -1).mean(axis=1)
+    lo = np.percentile(P, lo_pct)
+    return [int(v) for v in np.clip((P - lo) * 5.0, 0, 255)]
 
 
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--khz", type=float, required=True)
-    ap.add_argument("--antenna", default=os.environ.get("RT_AM_ANTENNA",
-                                                        "Antenna A"))
+    ap.add_argument("--deck", default="am", choices=("am", "sw"))
+    ap.add_argument("--antenna", default=None)
     ap.add_argument("--play", action="store_true")
     ap.add_argument("--chunk", type=float, default=6.0)
     args = ap.parse_args()
+    if args.antenna is None:
+        env = "RT_SW_ANTENNA" if args.deck == "sw" else "RT_AM_ANTENNA"
+        args.antenna = os.environ.get(env, "Antenna A")
 
     from scipy.signal import resample_poly
     target = args.khz * 1e3
-    raw_path = LAB / "am_live.s16"
+    raw_path = LAB / "band_live.s16"
     raw_path.write_bytes(b"")
 
     sdr, st = open_sdr(args.antenna)
     import SoapySDR
     sdr.setFrequency(SoapySDR.SOAPY_SDR_RX, 0, target - OFFSET)
-    print(f"[am_listen] {args.khz:.0f} kHz on {args.antenna} "
-          f"(offset-tuned, sync-AM)", flush=True)
+    print(f"[band_listen] {args.khz:.0f} kHz ({args.deck}) on "
+          f"{args.antenna} (offset-tuned, best chain)", flush=True)
 
     # player is spawned AFTER the first chunk exists — mpv on an empty raw
     # file hits instant EOF and exits, which used to kill the whole loop
@@ -62,7 +85,8 @@ def main():
              "--demuxer-rawaudio-channels=1", "--demuxer-rawaudio-format=s16le",
              "--force-seekable=no", "--cache=yes", "--keep-open=yes",
              "--volume=95",
-             f"--title=RADIO TUNA AM - {args.khz:.0f} kHz", str(raw_path)],
+             f"--title=RADIO TUNA {args.deck.upper()} - {args.khz:.0f} kHz",
+             str(raw_path)],
             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
     # best-chain state (AGC + adaptive bandwidth carry across chunks)
@@ -77,12 +101,14 @@ def main():
             # channelize 250k -> 20k (am_best's native rate)
             x = resample_poly(x, 2, 25).astype(np.complex64)
             x = x - np.mean(x)
+            spec = chan_spectrum(x)
             audio, diag = am_best.best_chunk(x, 20_000, state=state)
             audio = resample_poly(audio, AUD, 20_000).astype(np.float32)
             with open(raw_path, "ab") as f:
                 f.write((np.clip(audio, -1, 1) * 32000).astype(np.int16).tobytes())
-            # the truth dial, for the panel to read
-            diag.update({"deck": "am", "khz": args.khz, "ts": time.time()})
+            # the truth dial + waterfall row, for the panel to read
+            diag.update({"deck": args.deck, "khz": args.khz,
+                         "ts": time.time(), "spec": spec})
             try:
                 qual_path.write_text(json.dumps(diag))
             except OSError:
