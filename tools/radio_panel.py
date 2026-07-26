@@ -481,8 +481,17 @@ def stop_listen():
 # One radio, three decks: the albacore FM room plus a medium-wave deck and
 # a world-band shortwave deck, all sharing the single-tenant RSPdx through
 # the same stop_listen()/LIVE_PROCS discipline.
-BAND = {"am_stations": [], "sw_stations": [], "sw_band": "31m",
-        "am_hd": None, "deck": None, "khz": None, "scanning": False}
+# NOTE: BAND is the FM sweeper's dict (rows/hold, defined above) — the
+# deck state MERGES into it; replacing the dict silently killed the FM
+# spectrum thread once (KeyError: 'rows' in a daemon = invisible death)
+BAND.update({"am_stations": [], "sw_stations": [], "sw_band": "31m",
+             "am_hd": None, "deck": None, "khz": None, "scanning": False})
+for _deck_file, _key in (("am_stations.json", "am_stations"),
+                         ("sw_stations.json", "sw_stations")):
+    try:                       # survive panel restarts with full grids
+        BAND[_key] = json.loads((LAB / _deck_file).read_text())
+    except (OSError, ValueError):
+        pass
 AM_ANT = os.environ.get("RT_AM_ANTENNA", "Antenna A")   # the K-180WLA loop
 SW_ANT = os.environ.get("RT_SW_ANTENNA", "Antenna A")   # loop covers HF too
 SW_BANDS = {"49m": (5850, 6250), "41m": (7200, 7500), "31m": (9350, 9950),
@@ -654,6 +663,16 @@ def _snapshot_scan(center_hz, fs, secs=2.5, antenna=None, step_hz=10e3,
                 out.append({"khz": round(k / 1e3, 1), "db": round(db, 1)})
         k += step_hz
     out.sort(key=lambda s: -s["db"])
+    # publish a spectrum row so the deck waterfall paints during scans
+    try:
+        band_m = (f >= lo) & (f <= hi)
+        Pb = P[band_m]
+        row = Pb[:len(Pb) // 256 * 256].reshape(256, -1).max(axis=1)
+        BAND["scan_spec"] = {
+            "row": [int(v) for v in np.clip((row - floor) * 4.0, 0, 255)],
+            "lo": lo / 1e3, "hi": hi / 1e3, "ts": time.time()}
+    except Exception:
+        pass
     return out
 
 
@@ -708,11 +727,31 @@ def dx_summary():
                      for d, k, i, dk in top]}
 
 
+def _scan_begin(eta_s):
+    """Take the radio for a scan: refuse if a scan is already running,
+    yield any live listener (single-tenant SDR), start the progress
+    clock. Returns False if busy."""
+    with LOCK:
+        if BAND.get("scanning"):
+            return False                # two scan buttons at once — no glitch
+        BAND["scanning"] = True
+    BAND["hold"] = True                 # bench the FM idle sweeper — two
+    if LIVE_PROCS:                      # threads on one sdrplay = native crash
+        stop_listen()                   # scans take priority over listening
+    time.sleep(2.5)                     # let sweeper/listener fully release
+    BAND["scan_t0"] = time.time()
+    BAND["scan_eta"] = eta_s
+    return True
+
+
 def am_scan():
-    BAND["scanning"] = True
+    if not _scan_begin(22):
+        return
     try:
         found = _snapshot_scan(
             1115e3, 2e6, antenna=AM_ANT, lo_hz=530e3, hi_hz=1700e3)
+        if BAND.get("scan_spec"):
+            BAND["scan_spec"]["deck"] = "am"
         for s in found:
             s["id"], s["call"], s["link"] = _ident_am(s["khz"])
         BAND["am_stations"] = found
@@ -720,10 +759,13 @@ def am_scan():
         _dx_log("am", "MW", found)
     finally:
         BAND["scanning"] = False
+        if not LIVE_PROCS:
+            BAND["hold"] = False
 
 
 def sw_scan(band):
-    BAND["scanning"] = True
+    if not _scan_begin(25):
+        return
     try:
         lo, hi = SW_BANDS.get(band, SW_BANDS["31m"])
         center = (lo + hi) / 2 * 1e3
@@ -732,20 +774,26 @@ def sw_scan(band):
         found = _snapshot_scan(
             center, fs, antenna=SW_ANT, step_hz=5e3,
             lo_hz=lo * 1e3, hi_hz=hi * 1e3, thresh_db=10.0)
+        if BAND.get("scan_spec"):
+            BAND["scan_spec"]["deck"] = "sw"
         for s in found:
             s["id"], s["tx"], s["link"] = _ident_sw(s["khz"])
             s["band"] = band
         BAND["sw_stations"] = found
         BAND["sw_band"] = band
+        (LAB / "sw_stations.json").write_text(json.dumps(found))
         _dx_log("sw", band, found)
     finally:
         BAND["scanning"] = False
+        if not LIVE_PROCS:
+            BAND["hold"] = False
 
 
 def sw_scan_all():
     """World tour: sweep every broadcast band 49m..16m in one pass,
     accumulating results so the grid fills band by band as it goes."""
-    BAND["scanning"] = True
+    if not _scan_begin(30 * len(SW_BANDS)):
+        return
     BAND["sw_stations"] = []
     try:
         acc = []
@@ -761,19 +809,25 @@ def sw_scan_all():
                     lo_hz=lo * 1e3, hi_hz=hi * 1e3, thresh_db=10.0)
             except Exception:
                 continue                    # a dead band never kills the tour
+            if BAND.get("scan_spec"):
+                BAND["scan_spec"]["deck"] = "sw"
             for s in found:
                 s["id"], s["tx"], s["link"] = _ident_sw(s["khz"])
                 s["band"] = band
             acc.extend(found)
             _dx_log("sw", band, found)
             BAND["sw_stations"] = sorted(acc, key=lambda s: -s["db"])
+        (LAB / "sw_stations.json").write_text(json.dumps(BAND["sw_stations"]))
     finally:
         BAND["scanning"] = False
+        if not LIVE_PROCS:
+            BAND["hold"] = False
 
 
 def band_listen(deck, khz):
     stop_listen()
-    time.sleep(1)
+    BAND["hold"] = True      # bench the FM idle sweeper for the whole
+    time.sleep(1)            # session — it shares the one sdrplay device
     with LOCK:
         BAND["deck"] = deck
         BAND["khz"] = khz
@@ -1645,8 +1699,8 @@ background:rgba(8,14,22,.8);user-select:none}
 text-shadow:0 0 10px rgba(0,229,255,.7)}
 .decktab.am.on{color:#ffb457;border-color:rgba(255,180,87,.6);
 text-shadow:0 0 10px rgba(255,180,87,.7)}
-.decktab.sw.on{color:#4dff7c;border-color:rgba(77,255,124,.6);
-text-shadow:0 0 10px rgba(77,255,124,.7)}
+.decktab.sw.on{color:#f0e4c0;border-color:rgba(200,180,130,.6);
+text-shadow:0 0 10px rgba(240,222,170,.55)}
 .deck{display:none}.deck.on{display:block}
 /* AM deck — tube-glow nightwave */
 #cab-am{max-width:980px;margin:0 auto;padding:20px;border-radius:10px;
@@ -1672,30 +1726,44 @@ border-radius:6px;color:#d8b285;font-size:12px;min-height:20px}
 .ambar{display:inline-block;height:9px;background:linear-gradient(90deg,#7a4a12,#ffb457);
 border-radius:3px;vertical-align:middle}
 /* SW deck — world-band phosphor */
-#cab-sw{max-width:980px;margin:0 auto;padding:20px;border-radius:10px;
-background:linear-gradient(rgba(20,60,30,.12),transparent 40%),#020703;
-border:1px solid rgba(77,255,124,.35);
-box-shadow:0 0 24px rgba(60,255,120,.12),inset 0 0 70px rgba(0,0,0,.6);
-color:#a8e8bc;font-family:Consolas,monospace}
-#cab-sw h2{margin:0;color:#4dff7c;letter-spacing:4px;font-size:20px;
-text-shadow:0 0 14px rgba(77,255,124,.8)}
-#cab-sw .sub{color:#3f7a52}
-#sw-bands{display:flex;gap:6px;flex-wrap:wrap;margin:10px 0}
-.swband{cursor:pointer;padding:5px 12px;border:1px solid rgba(77,255,124,.4);
-border-radius:5px;color:#7fd89a;background:#04140a;font-size:12px;
-letter-spacing:1px}
-.swband.on,.swband:hover{color:#4dff7c;background:#0a2413;
-box-shadow:0 0 10px rgba(77,255,124,.3)}
+/* WORLDBAND: WW2 listening-post noir — black wrinkle-finish steel,
+   aged ivory dial lamps, oxidized brass, one deep signal-red accent.
+   The spy's band, with 2026 instruments bolted in. */
+#cab-sw{max-width:980px;margin:0 auto;padding:22px;border-radius:4px;
+background:
+ radial-gradient(ellipse 130% 90% at 50% 0%,rgba(240,222,170,.07),transparent 55%),
+ radial-gradient(ellipse 160% 120% at 50% 110%,transparent 40%,rgba(0,0,0,.75)),
+ #0a0908;
+border:1px solid #4a4030;outline:1px solid #171310;outline-offset:-5px;
+box-shadow:0 0 30px rgba(0,0,0,.8),inset 0 0 90px rgba(0,0,0,.7),
+ inset 0 1px 0 rgba(240,222,170,.08);
+color:#cfc4a0;font-family:'Courier New',Consolas,monospace}
+#cab-sw h2{margin:0;color:#f0e4c0;letter-spacing:7px;font-size:19px;
+font-weight:bold;text-shadow:0 0 12px rgba(240,222,170,.45);
+text-transform:uppercase}
+#cab-sw .sub{color:#8a7f60;letter-spacing:1px;font-style:italic}
+#sw-bands{display:flex;gap:6px;flex-wrap:wrap;margin:12px 0}
+.swband{cursor:pointer;padding:5px 12px;border:1px solid rgba(200,180,130,.35);
+border-radius:2px;color:#c9bd97;background:#141210;font-size:12px;
+letter-spacing:2px}
+.swband.on,.swband:hover{color:#f0e4c0;background:#26211a;
+border-color:#8a7f60;box-shadow:inset 0 0 8px rgba(0,0,0,.6),
+ 0 0 8px rgba(240,222,170,.15)}
 #cab-sw table{width:100%;border-collapse:collapse;font-size:13px}
-#cab-sw th{color:#3f7a52;text-align:left;padding:4px 8px;letter-spacing:1px;
-border-bottom:1px solid rgba(77,255,124,.25)}
-#cab-sw td{padding:4px 8px;border-bottom:1px solid rgba(77,255,124,.1)}
-#cab-sw tr:hover{background:rgba(60,255,120,.06)}
-.swbtn{cursor:pointer;background:#06180d;color:#7fffa5;border:1px solid
-rgba(77,255,124,.5);border-radius:5px;padding:4px 12px;font-family:inherit}
-.swbtn:hover{background:#0c2a16;box-shadow:0 0 10px rgba(77,255,124,.3)}
-.swbar{display:inline-block;height:9px;background:linear-gradient(90deg,#14522a,#4dff7c);
-border-radius:3px;vertical-align:middle}
+#cab-sw th{color:#8a7f60;text-align:left;padding:4px 8px;letter-spacing:2px;
+text-transform:uppercase;font-size:11px;
+border-bottom:1px double rgba(200,180,130,.35)}
+#cab-sw td{padding:4px 8px;border-bottom:1px solid rgba(200,180,130,.1)}
+#cab-sw tr:hover{background:rgba(240,222,170,.05)}
+.swbtn{cursor:pointer;background:#171412;color:#e8dcb8;border:1px solid
+rgba(200,180,130,.45);border-radius:2px;padding:4px 12px;font-family:inherit;
+letter-spacing:1px}
+.swbtn:hover{background:#242019;border-color:#b8483f;
+box-shadow:0 0 8px rgba(184,72,63,.3)}
+.swbar{display:inline-block;height:9px;
+background:linear-gradient(90deg,#4a3f28,#d8c690);
+border-radius:1px;vertical-align:middle;
+box-shadow:inset 0 -1px 0 rgba(0,0,0,.5)}
 </style></head><body>
 <div id="masthead">
   <div class="brand">RADIO <b>TUNA</b></div>
@@ -1788,6 +1856,10 @@ rgba(0,229,255,.35);border-radius:6px;margin:10px 0;padding:8px">
     <button class="ambtn" onclick="dxLog('am')">📖 DX LOG</button>
     <span id="am-status" style="margin-left:10px;color:#8a6a45"></span>
   </div>
+  <div id="am-pbar" style="display:none;height:8px;max-width:700px;margin:0 auto 8px;
+    border:1px solid rgba(255,180,87,.35);border-radius:4px;overflow:hidden">
+    <div style="width:0%;height:100%;background:#c8863f;transition:width .8s"></div>
+  </div>
   <div id="am-dx" style="display:none;margin-bottom:10px;padding:10px;
     border:1px dashed rgba(255,180,87,.4);border-radius:6px;font-size:12px"></div>
   <div id="am-hdbox">HD-AM: tune a station, then TRY HD — the 820 WSHE catch
@@ -1799,8 +1871,9 @@ rgba(0,229,255,.35);border-radius:6px;margin:10px 0;padding:8px">
 </div></div>
 
 <div id="deck-sw" class="deck"><div id="cab-sw">
-  <h2>WORLDBAND <span style="color:#a8e8bc">·</span> SHORTWAVE</h2>
-  <div class="sub">broadcast bands · EiBi schedule join = who's on the air at THIS minute (UTC)</div>
+  <h2>Worldband Listening Post</h2>
+  <div class="sub">shortwave · the spies' band since 1939, refitted with 2026 instruments
+    · EiBi schedule = who is transmitting at THIS minute (UTC)</div>
   <div id="sw-bands"></div>
   <div style="margin-bottom:8px">
     <button class="swbtn" onclick="swScan()">⌁ SCAN BAND</button>
@@ -1808,20 +1881,24 @@ rgba(0,229,255,.35);border-radius:6px;margin:10px 0;padding:8px">
     <button class="swbtn" onclick="bandStop()">■ STOP</button>
     <button class="swbtn" onclick="castToggle('sw')">🔊 CAST TO WI-FI SPEAKERS</button>
     <button class="swbtn" onclick="dxLog('sw')">📖 DX LOG</button>
-    <span id="sw-status" style="margin-left:10px;color:#3f7a52"></span>
-    <div id="sw-quality" style="display:none;font-size:12px;color:#a8e8bc;
+    <span id="sw-status" style="margin-left:10px;color:#8a7f60"></span>
+    <div id="sw-quality" style="display:none;font-size:12px;color:#cfc4a0;
       margin-top:6px"></div>
+    <div id="sw-pbar" style="display:none;height:8px;max-width:700px;margin:6px auto;
+      border:1px solid rgba(200,190,160,.35);border-radius:4px;overflow:hidden">
+      <div style="width:0%;height:100%;background:#b8a878;transition:width .8s"></div>
+    </div>
     <canvas id="sw-wf" width="384" height="90" style="display:none;width:100%;
-      max-width:700px;margin:6px auto;border:1px solid rgba(77,255,124,.25);
+      max-width:700px;margin:6px auto;border:1px solid rgba(200,180,130,.25);
       border-radius:4px;image-rendering:pixelated"></canvas>
     <div id="sw-dx" style="display:none;margin-top:8px;padding:10px;
-      border:1px dashed rgba(77,255,124,.4);border-radius:6px;font-size:12px"></div>
+      border:1px dashed rgba(200,180,130,.4);border-radius:6px;font-size:12px"></div>
   </div>
   <div id="sw-sched" style="display:none;margin-bottom:10px;padding:10px;
-    border:1px dashed rgba(77,255,124,.4);border-radius:6px;font-size:12px"></div>
+    border:1px dashed rgba(200,180,130,.4);border-radius:6px;font-size:12px"></div>
   <table><thead><tr><th>kHz</th><th>signal</th><th>on air now (EiBi)</th>
     <th></th></tr></thead><tbody id="sw-rows">
-    <tr><td colspan="4" style="color:#3f7a52">pick a band, scan the world…</td></tr>
+    <tr><td colspan="4" style="color:#8a7f60">pick a band, scan the world…</td></tr>
   </tbody></table>
 </div></div>
 
@@ -1836,10 +1913,14 @@ function deck(d){CUR_DECK=d;
   localStorage.setItem('rt_deck', d);}
 function post(u,b){return fetch(u,{method:'POST',
   headers:{'Content-Type':'application/json'},body:JSON.stringify(b||{})});}
-function amScan(){post('/api/am/scan');document.getElementById('am-status').textContent='scanning 530–1700…';}
-function swScan(){post('/api/sw/scan',{band:SW_BAND});document.getElementById('sw-status').textContent='scanning '+SW_BAND+'…';}
-function swScanAll(){post('/api/sw/scan_all');
-  document.getElementById('sw-status').textContent='world tour: sweeping 49m→16m…';}
+function _scanPost(url,body,el,msg){
+  post(url,body).then(r=>r.json()).then(v=>{
+    document.getElementById(el).textContent=
+      v==='busy'?'one scan at a time — the radio is taken':msg;
+  }).catch(()=>{});}
+function amScan(){_scanPost('/api/am/scan',null,'am-status','scanning 530–1700…');}
+function swScan(){_scanPost('/api/sw/scan',{band:SW_BAND},'sw-status','scanning '+SW_BAND+'…');}
+function swScanAll(){_scanPost('/api/sw/scan_all',null,'sw-status','world tour: sweeping 49m→16m…');}
 function bandStop(){post('/api/stop');}
 function bandListen(dk,khz){post('/api/band/listen',{deck:dk,khz:khz});
   document.getElementById(dk+'-status').textContent=
@@ -1850,11 +1931,11 @@ function amHD(khz){post('/api/am/hd',{khz:khz});
 function swSched(khz){
   const box=document.getElementById('sw-sched');
   box.style.display='block';
-  box.innerHTML='<span style="color:#3f7a52">loading schedule…</span>';
+  box.innerHTML='<span style="color:#8a7f60">loading schedule…</span>';
   fetch('/api/sw/sched?khz='+khz).then(r=>r.json()).then(j=>{
     if(!j.sched||!j.sched.length){
-      box.innerHTML=`<b style="color:#7fffa5">${khz.toFixed(0)} kHz</b> — no EiBi entries for this frequency. `+
-        `<span style="color:#3f7a52;cursor:pointer" `+
+      box.innerHTML=`<b style="color:#e8dcb8">${khz.toFixed(0)} kHz</b> — no EiBi entries for this frequency. `+
+        `<span style="color:#8a7f60;cursor:pointer" `+
         `onclick="document.getElementById('sw-sched').style.display='none'">[close]</span>`;return;}
     const now=new Date();
     const utc=now.getUTCHours()*100+now.getUTCMinutes();
@@ -1862,13 +1943,13 @@ function swSched(khz){
       const m=e.time.match(/(\\d{4})-(\\d{4})/)||['','0000','2400'];
       const a=+m[1],b=+m[2];
       const on=(a<=b)?(utc>=a&&utc<b):(utc>=a||utc<b);
-      return `<tr style="${on?'color:#7fffa5;font-weight:bold':'color:#4a8a5f'}">`+
+      return `<tr style="${on?'color:#e8dcb8;font-weight:bold':'color:#4a8a5f'}">`+
       `<td>${m[1].slice(0,2)}:${m[1].slice(2)}–${m[2].slice(0,2)}:${m[2].slice(2)} UTC${on?' ●':''}</td>`+
       `<td>${e.station}</td><td>${e.lang||''}</td><td>${e.target||''}</td>`+
-      `<td style="color:#3f9a5c">${e.tx||''}</td></tr>`;}).join('');
+      `<td style="color:#9a8a5f">${e.tx||''}</td></tr>`;}).join('');
     box.innerHTML=`<div style="display:flex;justify-content:space-between;margin-bottom:6px">`+
-      `<b style="color:#7fffa5">📅 ${khz.toFixed(0)} kHz — full day (EiBi)</b>`+
-      `<span style="color:#3f7a52;cursor:pointer" onclick="document.getElementById('sw-sched').style.display='none'">[close]</span></div>`+
+      `<b style="color:#e8dcb8">📅 ${khz.toFixed(0)} kHz — full day (EiBi)</b>`+
+      `<span style="color:#8a7f60;cursor:pointer" onclick="document.getElementById('sw-sched').style.display='none'">[close]</span></div>`+
       `<table style="width:100%"><thead><tr><th>time</th><th>station</th><th>lang</th><th>target</th><th>transmitter</th></tr></thead>`+
       `<tbody>${rows}</tbody></table>`;
   }).catch(()=>{box.innerHTML='schedule fetch failed';});}
@@ -1889,8 +1970,8 @@ function drawBandWF(dk,q){
   g.putImageData(img,0,6);              // scroll history down
   const row=g.createImageData(cv.width,6);
   const amber=v=>[Math.min(255,20+v*1.1),Math.min(255,8+v*0.75),4+v*0.12];
-  const green=v=>[4+v*0.15,Math.min(255,16+v*1.05),8+v*0.35];
-  const pal=dk==='am'?amber:green;
+  const sepia=v=>[Math.min(255,14+v*1.0),Math.min(255,11+v*0.9),8+v*0.6];
+  const pal=dk==='am'?amber:sepia;
   const sx=q.spec.length/cv.width;
   for(let x=0;x<cv.width;x++){
     const v=q.spec[Math.floor(x*sx)]||0;
@@ -1900,7 +1981,26 @@ function drawBandWF(dk,q){
       row.data[o]=r;row.data[o+1]=gg;row.data[o+2]=b;row.data[o+3]=255;}}
   g.putImageData(row,0,0);
 }
+const _scanLast={am:0,sw:0};
+function renderProgress(B){
+  for(const dk of ['am','sw']){
+    const bar=document.getElementById(dk+'-pbar');
+    if(!bar)continue;
+    if(B.scanning&&B.scan_pct!=null){
+      bar.style.display='block';
+      bar.firstElementChild.style.width=B.scan_pct+'%';
+      bar.title='~'+B.scan_left+'s left';
+    } else bar.style.display='none';
+  }
+  // a completed scan paints its full-band spectrum into the waterfall
+  const sp=B.scan_spec;
+  if(sp&&sp.deck&&sp.ts>_scanLast[sp.deck]){
+    _scanLast[sp.deck]=sp.ts;
+    drawBandWF(sp.deck,{spec:sp.row,ts:sp.ts});
+  }
+}
 function renderQuality(B){
+  renderProgress(B);
   const q=B.quality;
   for(const [dk,id] of [['am','am-quality'],['sw','sw-quality']]){
     const el=document.getElementById(id);
@@ -1922,7 +2022,7 @@ function dxLog(dk){
   box.style.display='block';
   box.innerHTML='reading the logbook…';
   fetch('/api/dx/summary').then(r=>r.json()).then(j=>{
-    const hue=dk==='am'?'#ffcf87':'#7fffa5';
+    const hue=dk==='am'?'#ffcf87':'#e8dcb8';
     let h=`<b style="color:${hue}">📖 DX LOGBOOK — band openings by hour</b>`+
       `<div style="font-size:11px;margin:2px 0 6px 0;opacity:.7">avg carriers heard per scan, by local hour — fills in as you keep scanning</div>`;
     const keys=Object.keys(j.hours).filter(k=>k.startsWith(dk+':')).sort();
@@ -1981,12 +2081,12 @@ function pollBand(){
           e.classList.toggle('on', e.dataset.b===B.sw_band));}
       const rows=B.sw_stations.map(s=>{
         const w=Math.min(90,Math.max(4,(s.db-8)*2));
-        const lk=s.link?` <a href="${s.link}" target="_blank" title="short-wave.info" style="color:#4dff7c;text-decoration:none">🔗</a>`:'';
-        const bd=s.band?`<span style="color:#3f7a52;font-size:10px"> ${s.band}</span>`:'';
-        return `<tr><td><b style="color:#7fffa5">${s.khz.toFixed(0)}</b>${bd}</td>`+
+        const lk=s.link?` <a href="${s.link}" target="_blank" title="short-wave.info" style="color:#f0e4c0;text-decoration:none">🔗</a>`:'';
+        const bd=s.band?`<span style="color:#8a7f60;font-size:10px"> ${s.band}</span>`:'';
+        return `<tr><td><b style="color:#e8dcb8">${s.khz.toFixed(0)}</b>${bd}</td>`+
         `<td><span class="swbar" style="width:${w}px"></span> ${s.db.toFixed(0)} dB</td>`+
-        `<td style="color:#a8e8bc">${s.id||'<span style="color:#3f7a52">unlisted</span>'}${lk}`+
-        (s.tx?`<br><span style="color:#3f9a5c;font-size:11px">📡 TX: ${s.tx}</span>`:'')+`</td>`+
+        `<td style="color:#cfc4a0">${s.id||'<span style="color:#8a7f60">unlisted</span>'}${lk}`+
+        (s.tx?`<br><span style="color:#9a8a5f;font-size:11px">📡 TX: ${s.tx}</span>`:'')+`</td>`+
         `<td><button class="swbtn" onclick="bandListen('sw',${s.khz})">▶ LISTEN</button> `+
         `<button class="swbtn" onclick="swSched(${s.khz})" title="when to listen — full day schedule">📅</button></td></tr>`;});
       if(rows.length)document.getElementById('sw-rows').innerHTML=rows.join('');
@@ -2376,7 +2476,14 @@ class H(BaseHTTPRequestHandler):
                  "cursor_mhz": cursor,
                  "rows": rows[-30:]}))
         elif self.path == "/api/band":
-            b = dict(BAND)
+            b = {k: BAND.get(k) for k in
+                 ("am_stations", "sw_stations", "sw_band", "am_hd",
+                  "deck", "khz", "scanning", "scan_spec")}
+            if BAND.get("scanning") and BAND.get("scan_t0"):
+                el = time.time() - BAND["scan_t0"]
+                eta = max(1.0, BAND.get("scan_eta", 25))
+                b["scan_pct"] = min(96, int(100 * el / eta))
+                b["scan_left"] = max(0, int(eta - el))
             try:
                 q = json.loads((LAB / "band_quality.json").read_text())
                 # live loops publish every ~6 s; 20 s = gone means gone
@@ -2456,14 +2563,23 @@ class H(BaseHTTPRequestHandler):
                              daemon=True).start()
             self._send('"listening"')
         elif self.path == "/api/am/scan":
+            if BAND.get("scanning"):
+                self._send('"busy"')
+                return
             threading.Thread(target=am_scan, daemon=True).start()
             self._send('"scanning"')
         elif self.path == "/api/sw/scan":
+            if BAND.get("scanning"):
+                self._send('"busy"')
+                return
             threading.Thread(target=sw_scan,
                              args=(req.get("band", "31m"),),
                              daemon=True).start()
             self._send('"scanning"')
         elif self.path == "/api/sw/scan_all":
+            if BAND.get("scanning"):
+                self._send('"busy"')
+                return
             threading.Thread(target=sw_scan_all, daemon=True).start()
             self._send('"scanning"')
         elif self.path == "/api/band/listen":
@@ -2476,6 +2592,7 @@ class H(BaseHTTPRequestHandler):
             am_hd_try(float(req.get("khz", 820)))
             self._send('"trying"')
         elif self.path == "/api/stop":
+            BAND["hold"] = False        # un-bench the idle sweeper
             threading.Thread(target=stop_listen, daemon=True).start()
             try:
                 import cast_local
