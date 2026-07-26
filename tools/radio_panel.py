@@ -682,8 +682,37 @@ def sw_scan(band):
             lo_hz=lo * 1e3, hi_hz=hi * 1e3, thresh_db=10.0)
         for s in found:
             s["id"], s["tx"], s["link"] = _ident_sw(s["khz"])
+            s["band"] = band
         BAND["sw_stations"] = found
         BAND["sw_band"] = band
+    finally:
+        BAND["scanning"] = False
+
+
+def sw_scan_all():
+    """World tour: sweep every broadcast band 49m..16m in one pass,
+    accumulating results so the grid fills band by band as it goes."""
+    BAND["scanning"] = True
+    BAND["sw_stations"] = []
+    try:
+        acc = []
+        for band in SW_BANDS:
+            BAND["sw_band"] = band          # progress shows in the chips
+            lo, hi = SW_BANDS[band]
+            center = (lo + hi) / 2 * 1e3
+            span = (hi - lo) * 1e3 + 100e3
+            fs = max(1e6, min(8e6, span * 1.25))
+            try:
+                found = _snapshot_scan(
+                    center, fs, antenna=SW_ANT, step_hz=5e3,
+                    lo_hz=lo * 1e3, hi_hz=hi * 1e3, thresh_db=10.0)
+            except Exception:
+                continue                    # a dead band never kills the tour
+            for s in found:
+                s["id"], s["tx"], s["link"] = _ident_sw(s["khz"])
+                s["band"] = band
+            acc.extend(found)
+            BAND["sw_stations"] = sorted(acc, key=lambda s: -s["db"])
     finally:
         BAND["scanning"] = False
 
@@ -1716,6 +1745,7 @@ rgba(0,229,255,.35);border-radius:6px;margin:10px 0;padding:8px">
   <div id="sw-bands"></div>
   <div style="margin-bottom:8px">
     <button class="swbtn" onclick="swScan()">⌁ SCAN BAND</button>
+    <button class="swbtn" onclick="swScanAll()" style="font-weight:bold">🌍 SCAN ALL BANDS</button>
     <button class="swbtn" onclick="bandStop()">■ STOP</button>
     <button class="swbtn" onclick="castToggle('sw')">🔊 CAST TO WI-FI SPEAKERS</button>
     <span id="sw-status" style="margin-left:10px;color:#3f7a52"></span>
@@ -1743,6 +1773,8 @@ function post(u,b){return fetch(u,{method:'POST',
   headers:{'Content-Type':'application/json'},body:JSON.stringify(b||{})});}
 function amScan(){post('/api/am/scan');document.getElementById('am-status').textContent='scanning 530–1700…';}
 function swScan(){post('/api/sw/scan',{band:SW_BAND});document.getElementById('sw-status').textContent='scanning '+SW_BAND+'…';}
+function swScanAll(){post('/api/sw/scan_all');
+  document.getElementById('sw-status').textContent='world tour: sweeping 49m→16m…';}
 function bandStop(){post('/api/stop');}
 function bandListen(dk,khz){post('/api/band/listen',{deck:dk,khz:khz});
   if(dk==='am')document.getElementById('am-freq').textContent=khz.toFixed(0)+' kHz';}
@@ -1816,12 +1848,17 @@ function pollBand(){
       if(rows.length)document.getElementById('am-rows').innerHTML=rows.join('');
     }
     if(CUR_DECK==='sw'){
-      document.getElementById('sw-status').textContent=B.scanning?'scanning…':
-        (B.sw_stations.length? B.sw_stations.length+' carriers in '+B.sw_band:'');
+      document.getElementById('sw-status').textContent=B.scanning?
+        ('scanning '+B.sw_band+'… ('+B.sw_stations.length+' so far)'):
+        (B.sw_stations.length? B.sw_stations.length+' carriers':'');
+      if(B.scanning&&B.sw_band){SW_BAND=B.sw_band;
+        document.querySelectorAll('.swband').forEach(e=>
+          e.classList.toggle('on', e.dataset.b===B.sw_band));}
       const rows=B.sw_stations.map(s=>{
         const w=Math.min(90,Math.max(4,(s.db-8)*2));
         const lk=s.link?` <a href="${s.link}" target="_blank" title="short-wave.info" style="color:#4dff7c;text-decoration:none">🔗</a>`:'';
-        return `<tr><td><b style="color:#7fffa5">${s.khz.toFixed(0)}</b></td>`+
+        const bd=s.band?`<span style="color:#3f7a52;font-size:10px"> ${s.band}</span>`:'';
+        return `<tr><td><b style="color:#7fffa5">${s.khz.toFixed(0)}</b>${bd}</td>`+
         `<td><span class="swbar" style="width:${w}px"></span> ${s.db.toFixed(0)} dB</td>`+
         `<td style="color:#a8e8bc">${s.id||'<span style="color:#3f7a52">unlisted</span>'}${lk}`+
         (s.tx?`<br><span style="color:#3f9a5c;font-size:11px">📡 TX: ${s.tx}</span>`:'')+`</td>`+
@@ -2296,6 +2333,9 @@ class H(BaseHTTPRequestHandler):
             threading.Thread(target=sw_scan,
                              args=(req.get("band", "31m"),),
                              daemon=True).start()
+            self._send('"scanning"')
+        elif self.path == "/api/sw/scan_all":
+            threading.Thread(target=sw_scan_all, daemon=True).start()
             self._send('"scanning"')
         elif self.path == "/api/band/listen":
             threading.Thread(target=band_listen,
