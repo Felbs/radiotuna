@@ -50,18 +50,23 @@ def main():
     print(f"[am_listen] {args.khz:.0f} kHz on {args.antenna} "
           f"(offset-tuned, sync-AM)", flush=True)
 
+    # player is spawned AFTER the first chunk exists — mpv on an empty raw
+    # file hits instant EOF and exits, which used to kill the whole loop
     player = None
-    if args.play:
-        player = subprocess.Popen(
+
+    def spawn_player():
+        return subprocess.Popen(
             [MPV, "--demuxer=rawaudio", "--demuxer-rawaudio-rate=%d" % AUD,
              "--demuxer-rawaudio-channels=1", "--demuxer-rawaudio-format=s16le",
-             "--force-seekable=no", "--cache=yes", "--volume=95",
+             "--force-seekable=no", "--cache=yes", "--keep-open=yes",
+             "--volume=95",
              f"--title=RADIO TUNA AM - {args.khz:.0f} kHz", str(raw_path)],
             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
     # slow AGC state that survives across chunks
     agc = 0.1
     sos = None
+    chunks_done = 0
     try:
         while True:
             iq = grab(sdr, st, args.chunk)
@@ -83,6 +88,9 @@ def main():
             audio = np.clip(audio * (0.25 / max(agc, 1e-6)), -1, 1)
             with open(raw_path, "ab") as f:
                 f.write((audio * 32000).astype(np.int16).tobytes())
+            chunks_done += 1
+            if args.play and player is None and chunks_done >= 1:
+                player = spawn_player()
             if player is not None and player.poll() is not None:
                 break                            # listener closed the window
     except KeyboardInterrupt:

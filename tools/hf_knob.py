@@ -67,10 +67,21 @@ _ensure_sdr_dll_path()
 
 
 def open_sdr(antenna):
+    import time as _time
     import SoapySDR
     from SoapySDR import SOAPY_SDR_RX, SOAPY_SDR_CS16
     SoapySDR.SoapySDR_setLogLevel(SoapySDR.SOAPY_SDR_FATAL)
-    sdr = SoapySDR.Device("driver=sdrplay")
+    # single-tenant SDR: a just-stopped scan/listener can hold the device
+    # for a few seconds — retry instead of dying silently
+    sdr = None
+    for attempt in range(4):
+        try:
+            sdr = SoapySDR.Device("driver=sdrplay")
+            break
+        except Exception:
+            if attempt == 3:
+                raise
+            _time.sleep(2.5)
     sdr.setSampleRate(SOAPY_SDR_RX, 0, FS)
     try:
         sdr.setAntenna(SOAPY_SDR_RX, 0, antenna)
