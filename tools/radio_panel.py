@@ -836,6 +836,12 @@ def band_listen(deck, khz):
     # truth dial + waterfall rows (sw_listen's 30 s batch is retired
     # from the panel - 30 silent seconds read as "it never played")
     ant = AM_ANT if deck == "am" else SW_ANT
+    try:                     # fresh stage line the instant the button lands
+        (LAB / "band_quality.json").write_text(json.dumps(
+            {"deck": deck, "khz": khz, "stage": "starting the listener…",
+             "ts": time.time()}))
+    except OSError:
+        pass
     p = subprocess.Popen([PY, str(HERE / "am_listen.py"),
                           "--khz", str(khz), "--deck", deck,
                           "--antenna", ant, "--play"])
@@ -1999,12 +2005,25 @@ function renderProgress(B){
     drawBandWF(sp.deck,{spec:sp.row,ts:sp.ts});
   }
 }
+let _listenT0=0;
 function renderQuality(B){
   renderProgress(B);
   const q=B.quality;
   for(const [dk,id] of [['am','am-quality'],['sw','sw-quality']]){
     const el=document.getElementById(id);
+    if(q&&q.deck===dk&&q.stage&&q.carrier_snr_db==null){
+      // startup narration: show exactly what the listener is doing,
+      // with a bar pacing the ~9 s to first audio
+      if(!_listenT0)_listenT0=Date.now();
+      const pct=Math.min(95,(Date.now()-_listenT0)/9000*100);
+      el.style.display='';
+      el.innerHTML=`▶ ${q.stage}<div style="height:6px;margin-top:4px;`+
+        `border:1px solid currentColor;border-radius:3px;opacity:.7">`+
+        `<div style="width:${pct}%;height:100%;background:currentColor"></div></div>`;
+      continue;
+    }
     if(q&&q.deck===dk){
+      _listenT0=0;
       el.style.display='';
       el.innerHTML=`TRUTH DIAL · carrier <b>${q.carrier_snr_db} dB</b>`+
         ` · co-channel ${q.cochannel}`+
