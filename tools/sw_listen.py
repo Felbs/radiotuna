@@ -113,14 +113,32 @@ def main():
     sdr, st = open_sdr(args.antenna)
     import SoapySDR
     from SoapySDR import SOAPY_SDR_RX
-    sdr.setFrequency(SOAPY_SDR_RX, 0, args.khz * 1e3)
+    OFFSET = 30e3          # DC spike stays out of channel (the 7/26 law)
+    sdr.setFrequency(SOAPY_SDR_RX, 0, args.khz * 1e3 - OFFSET)
     time.sleep(0.2)
     iq = grab(sdr, st, args.secs)
     sdr.deactivateStream(st)
     sdr.closeStream(st)
+    n = np.arange(len(iq), dtype=np.float64)
+    iq = (iq * np.exp(-2j * np.pi * OFFSET / FS * n)).astype(np.complex64)
     print(f"[listen] captured {len(iq)/FS:.1f}s - SDR released. demodulating ...")
     out = LAB / f"sw_{int(args.khz)}.wav"
-    dur = am_demod_wav(iq, out)
+    if _os.environ.get("RT_AM_CHAIN", "best") == "v1":
+        dur = am_demod_wav(iq, out)
+        diag = None
+    else:
+        import json
+        import am_best
+        dur, diag = am_best.demod_wav(iq, out, fs=FS)
+        diag.update({"deck": "sw", "khz": args.khz, "ts": time.time()})
+        try:
+            (LAB / "band_quality.json").write_text(json.dumps(diag))
+        except OSError:
+            pass
+        print(f"[best] carrier {diag['carrier_snr_db']} dB  "
+              f"co-ch {diag['cochannel']}  fades {diag['fade_frac6']*100:.0f}%  "
+              f"BW {diag['cutoff_hz']} Hz  hets {diag['hets_hz']}  "
+              f"tilt {diag['tilt_db']} dB")
     print(f"[listen] wrote {out} ({dur:.0f}s)")
     if args.play and Path(MPV).exists():
         print("[listen] playing through speakers ...")
