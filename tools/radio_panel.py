@@ -854,8 +854,10 @@ def rate_band(deck, top=40):
                 try:
                     _a, d = am_best.best_chunk(x, 20_000, rescue=False)
                     s["q"], s["grade"] = d["quality"], d["grade"]
+                    s["q_ts"] = time.time()
                 except Exception:
                     s["q"], s["grade"] = 0, "STATIC"
+                    s["q_ts"] = time.time()
         finally:
             try:
                 sdr.deactivateStream(st)
@@ -889,9 +891,11 @@ def autotune(deck):
                     and q.get("quality") is not None
                     and q["quality"] >= 25):
                 s["q"], s["grade"] = q["quality"], q["grade"]
+                s["q_ts"] = time.time()
                 return                   # verified alive - keep it
             if q.get("quality") is not None:
                 s["q"], s["grade"] = q["quality"], q["grade"]
+                s["q_ts"] = time.time()
         except (OSError, ValueError):
             pass
     # nothing verified: stay on the last candidate rather than silence
@@ -2042,7 +2046,11 @@ function sortRows(dk,rows){
 function qBadge(s){
   if(s.q==null)return '';
   const c=s.q>=75?'#7dc87d':s.q>=55?'#c8b87d':s.q>=35?'#c8987d':'#c87d7d';
-  return `<span title="${s.grade}" style="color:${c};font-weight:bold"> ★${s.q}</span>`;
+  const age=s.q_ts?Math.round((Date.now()/1000-s.q_ts)/60):null;
+  const stale=age!=null&&age>25;   // SW conditions turn over in minutes
+  const tip=`${s.grade}${age!=null?` — rated ${age} min ago`:''}${stale?' (STALE — conditions have moved on, re-rate)':''}`;
+  return `<span title="${tip}" style="color:${c};font-weight:bold;`+
+    `${stale?'opacity:.45;font-style:italic':''}"> ★${s.q}${stale?'?':''}</span>`;
 }
 function swScan(){_scanPost('/api/sw/scan',{band:SW_BAND},'sw-status','scanning '+SW_BAND+'…');}
 function swScanAll(){_scanPost('/api/sw/scan_all',null,'sw-status','world tour: sweeping 49m→16m…');}
@@ -2651,6 +2659,17 @@ class H(BaseHTTPRequestHandler):
                 # live loops publish every ~6 s; 20 s = gone means gone
                 if time.time() - q.get("ts", 0) < 20:
                     b["quality"] = q
+                    # self-correcting grid: every live listen refreshes
+                    # that station's star with the CURRENT verdict
+                    if q.get("quality") is not None:
+                        key = ("am_stations" if q.get("deck") == "am"
+                               else "sw_stations")
+                        for s in BAND.get(key) or []:
+                            if s["khz"] == q.get("khz"):
+                                s["q"] = q["quality"]
+                                s["grade"] = q["grade"]
+                                s["q_ts"] = q["ts"]
+                                break
             except (OSError, ValueError):
                 pass
             self._send(json.dumps(b))
