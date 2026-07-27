@@ -56,27 +56,41 @@ def nail_carrier(x, fs):
     dial. Returns (offset_hz, carrier_snr_db, n_cochannel)."""
     n = 1 << max(12, min(15, int(np.log2(max(len(x), 4096)))))
     n = min(n, len(x))
-    seg = x[:len(x) // n * n].reshape(-1, n) * np.hanning(n).astype(np.float32)
-    P = (np.abs(np.fft.fftshift(np.fft.fft(seg, axis=1), axes=1)) ** 2).mean(axis=0)
+    segs = np.abs(np.fft.fftshift(
+        np.fft.fft(x[:len(x) // n * n].reshape(-1, n)
+                   * np.hanning(n).astype(np.float32), axis=1), axes=1)) ** 2
+    P = segs.mean(axis=0)
     f = np.fft.fftshift(np.fft.fftfreq(n, 1 / fs))
     m = np.abs(f) < 500.0
     # carrier prominence = line power over the local floor -> the SNR dial
     pk = float(P[m].max())
     floor = float(np.median(P[m]))
-    # co-channel census: lines >= floor+14 dB inside +-250 Hz, greedily
-    # separated by > 4 Hz so one fat line never counts twice
+    # co-channel census on the MIN-hold PSD: a co-channel carrier is a
+    # line that persists through every segment; program bass sidebands
+    # flicker with the modulation and drop out of the minimum. (The
+    # mean-PSD census counted a local blowtorch's bass as 5 stations.)
+    Pmin = segs.min(axis=0) if len(segs) > 1 else P
     mm = np.abs(f) < 250.0
-    Pm, fm = P[mm].copy(), f[mm]
-    thresh = floor * 10 ** 1.4
+    Pm, fm = Pmin[mm].copy(), f[mm]
+    floor_min = float(np.median(Pmin[m]))
+    thresh = floor_min * 10 ** 1.4
     lines = []
+    powers = []
     while True:
         i = int(np.argmax(Pm))
         if Pm[i] < thresh or len(lines) >= 5:
             break
         lines.append(float(fm[i]))
+        powers.append(float(Pm[i]))
         Pm[np.abs(fm - fm[i]) < 4.0] = 0.0
+    # dominance: how far the loudest RIVAL line sits below the main
+    # carrier - five buried co-channels are harmless, one at -8 dB is
+    # a ruined channel. This is the number quality should care about.
+    dom = 99.0
+    if len(powers) >= 2:
+        dom = 10 * np.log10(max(powers[0], 1e-18) / max(powers[1], 1e-18))
     return (f[m][np.argmax(P[m])], 10 * np.log10(pk / max(floor, 1e-18)),
-            max(1, len(lines)))
+            max(1, len(lines)), round(float(dom), 1))
 
 
 def _sidebands(y, fs):
@@ -128,7 +142,10 @@ def _adaptive_cutoff(y, fs, state):
     f = np.fft.fftshift(np.fft.fftfreq(n, 1 / fs))
     hi = min(0.45 * fs, 9000.0)
     nz = (np.abs(f) > 5500.0) & (np.abs(f) < hi)
-    N0 = float(np.median(P[nz])) if nz.any() else float(np.median(P))
+    # 15th percentile, not median: on real bands the out-of-channel
+    # region CONTAINS the adjacent stations (10 kHz AM / 5 kHz SW
+    # spacing) - true noise lives in the quiet bins between them
+    N0 = float(np.percentile(P[nz], 15)) if nz.any() else float(np.median(P))
     pos = f > 0
     fp = f[pos]
     fold = P[pos] + np.interp(-fp, f, P)          # USB + LSB power per band
@@ -160,8 +177,9 @@ def best_chunk(x, fs, state=None, rescue=True):
         state = {}
     diag = {}
     # 1. carrier nail + filter-lock (vectorized PLL)
-    doff, csnr, ncoch = nail_carrier(x, fs)
+    doff, csnr, ncoch, dom = nail_carrier(x, fs)
     diag["cochannel"] = ncoch
+    diag["coch_dom_db"] = dom
     n = np.arange(len(x), dtype=np.float64)
     x = x * np.exp(-2j * np.pi * doff / fs * n).astype(np.complex64)
     c = filtfilt(firwin(2049, CARRIER_BW / (fs / 2)), [1.0], x)
@@ -252,12 +270,14 @@ def best_chunk(x, fs, state=None, rescue=True):
 
     # the AUDIO QUALITY score - the STVT watchability law on radio:
     # quality = delivery x (1 - errors), every term measured above.
-    # base: sigmoid on honest audio SNR (5 dB ~ 19, 15 ~ 50, 25 ~ 81)
-    base = 100.0 / (1.0 + np.exp(-(audio_snr - 15.0) / 7.0))
+    # base: sigmoid on honest audio SNR (5 dB ~ 27, 12 ~ 50, 22 ~ 81)
+    base = 100.0 / (1.0 + np.exp(-(audio_snr - 12.0) / 7.0))
     delivery = 1.0 - min(1.0, diag["fade_frac6"] * 2.5)   # fades steal words
     fidelity = 0.85 + 0.15 * (cut / CUT_MAX)              # bandwidth = warmth
     q = base * delivery * fidelity
-    q -= (14 if ncoch >= 3 else 6 if ncoch == 2 else 0)   # audible neighbors
+    # co-channel penalty rides DOMINANCE, not headcount: five rivals
+    # buried 30 dB down are inaudible; one at 8 dB ruins the channel
+    q -= (20 if dom < 8 else 10 if dom < 15 else 4 if dom < 22 else 0)
     q -= 2 * len(hets)                                    # notched, scarred
     q = int(np.clip(q, 0, 100))
     diag["quality"] = q
@@ -335,7 +355,7 @@ def cmd_selftest():
     y2 = (y2 + 0.35 * ni).astype(np.complex64)
     b2, d2 = best_chunk(y2.copy(), fs, rescue=False)
     # plain DSB sync = equal-weight sidebands on the same front-end
-    doff, _, _ = nail_carrier(y2, fs)
+    doff, _, _, _ = nail_carrier(y2, fs)
     yc = y2 * np.exp(-2j * np.pi * doff / fs * np.arange(len(y2))).astype(np.complex64)
     c = filtfilt(firwin(2049, CARRIER_BW / (fs / 2)), [1.0], yc)
     ycl = (yc * np.conj(c / np.maximum(np.abs(c), 1e-12))).astype(np.complex64)
@@ -351,7 +371,7 @@ def cmd_selftest():
     # C. clean symmetric: the chain must do no harm
     y3 = s + (rng.normal(0, .02, len(t)) + 1j * rng.normal(0, .02, len(t))).astype(np.complex64)
     b3, d3 = best_chunk(y3.copy(), fs, rescue=False)
-    doff, _, _ = nail_carrier(y3, fs)
+    doff, _, _, _ = nail_carrier(y3, fs)
     yc = y3 * np.exp(-2j * np.pi * doff / fs * np.arange(len(y3))).astype(np.complex64)
     c = filtfilt(firwin(2049, CARRIER_BW / (fs / 2)), [1.0], yc)
     sync = (yc * np.conj(c / np.maximum(np.abs(c), 1e-12))).real.astype(np.float32)
