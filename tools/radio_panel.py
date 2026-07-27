@@ -824,6 +824,63 @@ def sw_scan_all():
             BAND["hold"] = False
 
 
+def rate_band(deck, top=40):
+    """Tune each of the deck's strongest carriers for 2.5 s, run the
+    best chain, and stamp its AUDIO QUALITY into the grid - so the
+    table says which rows are worth clicking BEFORE you click. (Scan
+    dB never promised listenability; 6170 taught that at 31 dB of
+    pure static.)"""
+    if not _scan_begin(int(top * 3.4)):
+        return
+    try:
+        key = "am_stations" if deck == "am" else "sw_stations"
+        sts = sorted(BAND[key], key=lambda s: -s["db"])[:top]
+        import SoapySDR
+        from scipy.signal import resample_poly
+        import am_best
+        import hf_knob
+        sdr, st = hf_knob.open_sdr(AM_ANT if deck == "am" else SW_ANT)
+        try:
+            for s in sts:
+                sdr.setFrequency(SoapySDR.SOAPY_SDR_RX, 0,
+                                 s["khz"] * 1e3 - 30e3)
+                time.sleep(0.2)
+                _ = hf_knob.grab(sdr, st, 0.25)   # flush retune transient
+                iq = hf_knob.grab(sdr, st, 2.5)
+                n = np.arange(len(iq), dtype=np.float64)
+                x = iq * np.exp(-2j * np.pi * 30e3 / hf_knob.FS * n)
+                x = resample_poly(x, 2, 25).astype(np.complex64)
+                x = x - np.mean(x)
+                try:
+                    _a, d = am_best.best_chunk(x, 20_000, rescue=False)
+                    s["q"], s["grade"] = d["quality"], d["grade"]
+                except Exception:
+                    s["q"], s["grade"] = 0, "STATIC"
+        finally:
+            try:
+                sdr.deactivateStream(st)
+                sdr.closeStream(st)
+            except Exception:
+                pass
+        (LAB / f"{deck}_stations.json").write_text(json.dumps(BAND[key]))
+    finally:
+        BAND["scanning"] = False
+        if not LIVE_PROCS:
+            BAND["hold"] = False
+
+
+def autotune(deck):
+    """One click to the best-sounding station: rate the band if it has
+    no ratings yet, then tune the highest AUDIO QUALITY row."""
+    key = "am_stations" if deck == "am" else "sw_stations"
+    if not any(s.get("q") is not None for s in BAND[key]):
+        rate_band(deck)
+    rated = [s for s in BAND[key] if s.get("q") is not None]
+    if rated:
+        best = max(rated, key=lambda s: s["q"])
+        band_listen(deck, best["khz"])
+
+
 def band_listen(deck, khz):
     stop_listen()
     BAND["hold"] = True      # bench the FM idle sweeper for the whole
@@ -1857,6 +1914,8 @@ rgba(0,229,255,.35);border-radius:6px;margin:10px 0;padding:8px">
     border-radius:4px;image-rendering:pixelated"></canvas>
   <div style="text-align:center;margin-bottom:8px">
     <button class="ambtn" onclick="amScan()">⌁ SCAN THE BAND</button>
+    <button class="ambtn" onclick="rateBand('am')">★ RATE TOP 40</button>
+    <button class="ambtn" onclick="autoTune('am')" style="font-weight:bold">🎯 AUTO-TUNE BEST</button>
     <button class="ambtn" onclick="bandStop()">■ STOP</button>
     <button class="ambtn" onclick="castToggle('am')">🔊 CAST TO WI-FI SPEAKERS</button>
     <button class="ambtn" onclick="dxLog('am')">📖 DX LOG</button>
@@ -1884,6 +1943,8 @@ rgba(0,229,255,.35);border-radius:6px;margin:10px 0;padding:8px">
   <div style="margin-bottom:8px">
     <button class="swbtn" onclick="swScan()">⌁ SCAN BAND</button>
     <button class="swbtn" onclick="swScanAll()" style="font-weight:bold">🌍 SCAN ALL BANDS</button>
+    <button class="swbtn" onclick="rateBand('sw')">★ RATE TOP 40</button>
+    <button class="swbtn" onclick="autoTune('sw')" style="font-weight:bold">🎯 AUTO-TUNE BEST</button>
     <button class="swbtn" onclick="bandStop()">■ STOP</button>
     <button class="swbtn" onclick="castToggle('sw')">🔊 CAST TO WI-FI SPEAKERS</button>
     <button class="swbtn" onclick="dxLog('sw')">📖 DX LOG</button>
@@ -1925,6 +1986,15 @@ function _scanPost(url,body,el,msg){
       v==='busy'?'one scan at a time — the radio is taken':msg;
   }).catch(()=>{});}
 function amScan(){_scanPost('/api/am/scan',null,'am-status','scanning 530–1700…');}
+function rateBand(dk){_scanPost('/api/band/rate',{deck:dk},dk+'-status',
+  'rating the top 40 by ear — ~2 min…');}
+function autoTune(dk){_scanPost('/api/band/autotune',{deck:dk},dk+'-status',
+  'auto-tune: finding the best-sounding station…');}
+function qBadge(s){
+  if(s.q==null)return '';
+  const c=s.q>=75?'#7dc87d':s.q>=55?'#c8b87d':s.q>=35?'#c8987d':'#c87d7d';
+  return `<span title="${s.grade}" style="color:${c};font-weight:bold"> ★${s.q}</span>`;
+}
 function swScan(){_scanPost('/api/sw/scan',{band:SW_BAND},'sw-status','scanning '+SW_BAND+'…');}
 function swScanAll(){_scanPost('/api/sw/scan_all',null,'sw-status','world tour: sweeping 49m→16m…');}
 function bandStop(){post('/api/stop');}
@@ -2087,7 +2157,7 @@ function pollBand(){
       const rows=B.am_stations.map(s=>{
         const w=Math.min(90,Math.max(4,(s.db-10)*1.6));
         const lk=s.link?` <a href="${s.link}" target="_blank" title="tower location map (radio-locator)" style="color:#ffb457;text-decoration:none">🗺</a>`:'';
-        return `<tr><td><b style="color:#ffcf87">${s.khz.toFixed(0)}</b></td>`+
+        return `<tr><td><b style="color:#ffcf87">${s.khz.toFixed(0)}</b>${qBadge(s)}</td>`+
         `<td><span class="ambar" style="width:${w}px"></span> ${s.db.toFixed(0)} dB</td>`+
         `<td style="color:${s.id&&s.id.includes('MA3')?'#ffd700':'#d8b285'}">${s.id||'—'}${lk}</td>`+
         `<td><button class="ambtn" onclick="bandListen('am',${s.khz})">▶ LISTEN</button></td>`+
@@ -2113,7 +2183,7 @@ function pollBand(){
         const w=Math.min(90,Math.max(4,(s.db-8)*2));
         const lk=s.link?` <a href="${s.link}" target="_blank" title="short-wave.info" style="color:#f0e4c0;text-decoration:none">🔗</a>`:'';
         const bd=s.band?`<span style="color:#8a7f60;font-size:10px"> ${s.band}</span>`:'';
-        return `<tr><td><b style="color:#e8dcb8">${s.khz.toFixed(0)}</b>${bd}</td>`+
+        return `<tr><td><b style="color:#e8dcb8">${s.khz.toFixed(0)}</b>${bd}${qBadge(s)}</td>`+
         `<td><span class="swbar" style="width:${w}px"></span> ${s.db.toFixed(0)} dB</td>`+
         `<td style="color:#cfc4a0">${s.id||'<span style="color:#8a7f60">unlisted</span>'}${lk}`+
         (s.tx?`<br><span style="color:#9a8a5f;font-size:11px">📡 TX: ${s.tx}</span>`:'')+`</td>`+
@@ -2618,6 +2688,22 @@ class H(BaseHTTPRequestHandler):
                 return
             threading.Thread(target=sw_scan_all, daemon=True).start()
             self._send('"scanning"')
+        elif self.path == "/api/band/rate":
+            if BAND.get("scanning"):
+                self._send('"busy"')
+                return
+            threading.Thread(target=rate_band,
+                             args=(req.get("deck", "sw"),),
+                             daemon=True).start()
+            self._send('"rating"')
+        elif self.path == "/api/band/autotune":
+            if BAND.get("scanning"):
+                self._send('"busy"')
+                return
+            threading.Thread(target=autotune,
+                             args=(req.get("deck", "sw"),),
+                             daemon=True).start()
+            self._send('"autotuning"')
         elif self.path == "/api/band/listen":
             threading.Thread(target=band_listen,
                              args=(req.get("deck", "am"),

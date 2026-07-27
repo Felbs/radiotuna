@@ -279,6 +279,13 @@ def best_chunk(x, fs, state=None, rescue=True):
     # buried 30 dB down are inaudible; one at 8 dB ruins the channel
     q -= (20 if dom < 8 else 10 if dom < 15 else 4 if dom < 22 else 0)
     q -= 2 * len(hets)                                    # notched, scarred
+    # carrier sanity gate: with no real carrier the chain locks noise
+    # and every downstream number is fiction (6170 kHz read ROUGH on an
+    # EMPTY channel before this) - an absent station is STATIC, period
+    if csnr < 12:
+        q = min(q, 8)
+    elif csnr < 18:
+        q = min(q, 30)
     q = int(np.clip(q, 0, 100))
     diag["quality"] = q
     diag["grade"] = ("EXCELLENT" if q >= 75 else "GOOD" if q >= 55 else
