@@ -112,8 +112,18 @@ def features(x, fs):
     near_mid = float(((env > mid * 0.9) & (env < mid * 1.1)).mean())
     f["bimodal"] = round(1.0 - near_mid, 2) if hi > 1.5 * max(lo, 1e-6) else 0.0
     # mostly-on keying (an NDB idles ON and gaps only for its ID): the
-    # percentiles both sit at "on", but the OFF dips are unmistakable
-    f["dips"] = round(float((env < 0.55).mean()), 3)
+    # percentiles both sit at "on", but the OFF dips are unmistakable.
+    # DURATION-GATED: morse elements are 40-400 ms; slow QSB fades are
+    # seconds long and must not read as keying (the WTWW lesson)
+    low = env < 0.55
+    dip_frac = 0.0
+    if low.any():
+        d = np.diff(np.concatenate([[0], low.astype(int), [0]]))
+        starts, ends = np.where(d == 1)[0], np.where(d == -1)[0]
+        fast = [(e - s) for s, e in zip(starts, ends)
+                if 0.03 * 1000 <= (e - s) <= 0.5 * 1000]
+        dip_frac = sum(fast) / len(env)
+    f["dips"] = round(float(dip_frac), 3)
 
     # demodulated-audio character (voice breathes and slopes; data hisses)
     if len(x) >= 4 * fs // 2:
