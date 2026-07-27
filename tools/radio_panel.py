@@ -1910,6 +1910,7 @@ rgba(0,229,255,.35);border-radius:6px;margin:10px 0;padding:8px">
  <button class="knob" onclick="stopL()">&#x23F9; STOP</button>
  <button class="knob hot" id="castbtn" onclick="castToggle('fm')">&#x1F50A;
  CAST TO WI-FI SPEAKERS</button>
+ <button class="knob" id="fm-sort" onclick="cycleSort('fm')">⇅ SORT: FREQUENCY</button>
 </div>
 <div id="status"></div>
 <div id="pbar"><div style="width:0%"></div></div>
@@ -1935,6 +1936,7 @@ rgba(0,229,255,.35);border-radius:6px;margin:10px 0;padding:8px">
     <button class="ambtn" onclick="bandStop()">■ STOP</button>
     <button class="ambtn" onclick="castToggle('am')">🔊 CAST TO WI-FI SPEAKERS</button>
     <button class="ambtn" onclick="dxLog('am')">📖 DX LOG</button>
+    <button class="ambtn" id="am-sort" onclick="cycleSort('am')">⇅ SORT: SIGNAL</button>
     <span id="am-status" style="margin-left:10px;color:#8a6a45"></span>
   </div>
   <div id="am-pbar" style="display:none;height:8px;max-width:700px;margin:0 auto 8px;
@@ -1970,6 +1972,7 @@ rgba(0,229,255,.35);border-radius:6px;margin:10px 0;padding:8px">
     <button class="swbtn" onclick="bandStop()">■ STOP</button>
     <button class="swbtn" onclick="castToggle('sw')">🔊 CAST TO WI-FI SPEAKERS</button>
     <button class="swbtn" onclick="dxLog('sw')">📖 DX LOG</button>
+    <button class="swbtn" id="sw-sort" onclick="cycleSort('sw')">⇅ SORT: SIGNAL</button>
     <span id="sw-status" style="margin-left:10px;color:#8a7f60"></span>
     <div id="sw-quality" style="display:none;font-size:12px;color:#cfc4a0;
       margin-top:6px"></div>
@@ -2018,6 +2021,24 @@ function rateBand(dk){_scanPost('/api/band/rate',{deck:dk},dk+'-status',
   'rating the top 40 by ear — ~2 min…');}
 function autoTune(dk){_scanPost('/api/band/autotune',{deck:dk},dk+'-status',
   'auto-tune: finding the best-sounding station…');}
+const SORT={am:'db',sw:'db',fm:'mhz'};
+const SORT_LABEL={db:'⇅ SORT: SIGNAL',khz:'⇅ SORT: FREQUENCY',
+  mhz:'⇅ SORT: FREQUENCY',q:'⇅ SORT: QUALITY'};
+function cycleSort(dk){
+  const fr=dk==='fm'?'mhz':'khz';
+  SORT[dk]=SORT[dk]==='db'?fr:(SORT[dk]===fr?'q':'db');
+  document.getElementById(dk+'-sort').textContent=SORT_LABEL[SORT[dk]];
+  if(dk==='fm'){if(typeof refresh==='function')refresh();}
+  else pollBand();
+}
+function sortRows(dk,rows){
+  const m=SORT[dk];
+  const r=rows.slice();
+  if(m==='khz')r.sort((a,b)=>a.khz-b.khz);
+  else if(m==='q')r.sort((a,b)=>((b.q??-1)-(a.q??-1))||(b.db-a.db)); // unrated sink
+  else r.sort((a,b)=>b.db-a.db);
+  return r;
+}
 function qBadge(s){
   if(s.q==null)return '';
   const c=s.q>=75?'#7dc87d':s.q>=55?'#c8b87d':s.q>=35?'#c8987d':'#c87d7d';
@@ -2182,7 +2203,7 @@ function pollBand(){
         let h='HD-AM: '+B.am_hd.stage+(B.am_hd.verdict?' — '+B.am_hd.verdict:'');
         if(B.am_hd.log)h+='<br><span style="color:#a8865f;font-size:11px">'+B.am_hd.log.slice(0,4).join('<br>')+'</span>';
         document.getElementById('am-hdbox').innerHTML=h;}
-      const rows=B.am_stations.map(s=>{
+      const rows=sortRows('am',B.am_stations).map(s=>{
         const w=Math.min(90,Math.max(4,(s.db-10)*1.6));
         const lk=s.link?` <a href="${s.link}" target="_blank" title="tower location map (radio-locator)" style="color:#ffb457;text-decoration:none">🗺</a>`:'';
         return `<tr><td><b style="color:#ffcf87">${s.khz.toFixed(0)}</b>${qBadge(s)}</td>`+
@@ -2207,7 +2228,7 @@ function pollBand(){
       if(B.scanning&&B.sw_band){SW_BAND=B.sw_band;
         document.querySelectorAll('.swband').forEach(e=>
           e.classList.toggle('on', e.dataset.b===B.sw_band));}
-      const rows=B.sw_stations.map(s=>{
+      const rows=sortRows('sw',B.sw_stations).map(s=>{
         const w=Math.min(90,Math.max(4,(s.db-8)*2));
         const lk=s.link?` <a href="${s.link}" target="_blank" title="short-wave.info" style="color:#f0e4c0;text-decoration:none">🔗</a>`:'';
         const bd=s.band?`<span style="color:#8a7f60;font-size:10px"> ${s.band}</span>`:'';
@@ -2483,9 +2504,16 @@ else if(st.hd){hdg=st.mer_lo>=10?'A':st.mer_lo>=4?'B':'C';}
 return {hdg,fmg,ant};}
 const GCOL={A:'#39ff8a',B:'#ffb84d',C:'#ff6b4d'};
 let h='<table>';
-for(const st of stations){
+const gv=x=>({A:3,B:2,C:1}[x]||0);
+let glist=stations.map(st=>{
 const t=(s.tune||{})[st.mhz.toFixed(1)];
-const g=grade(st,t);
+return {st,t,g:grade(st,t)};});
+if(SORT.fm==='mhz')glist.sort((a,b)=>a.st.mhz-b.st.mhz);
+else if(SORT.fm==='q')glist.sort((a,b)=>
+(Math.max(gv(b.g.hdg),gv(b.g.fmg))-Math.max(gv(a.g.hdg),gv(a.g.fmg)))
+||((b.st.rssi||0)-(a.st.rssi||0)));
+else glist.sort((a,b)=>(b.st.rssi||0)-(a.st.rssi||0));
+for(const {st,t,g} of glist){
 const w=Math.max(4,Math.min(100,st.rssi/40*100));
 const isLive=s.listening&&s.mhz===st.mhz;
 h+='<tr'+(isLive?' style="background:rgba(255,43,214,.07)"':'')+
