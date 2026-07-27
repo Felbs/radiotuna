@@ -2025,7 +2025,12 @@ function renderQuality(B){
     if(q&&q.deck===dk){
       _listenT0=0;
       el.style.display='';
-      el.innerHTML=`TRUTH DIAL · carrier <b>${q.carrier_snr_db} dB</b>`+
+      const gc=q.quality>=75?'#7dc87d':q.quality>=55?'#c8b87d':
+        q.quality>=35?'#c8987d':'#c87d7d';
+      el.innerHTML=(q.quality!=null?
+        `AUDIO QUALITY <b style="color:${gc}">${q.quality}/100 ${q.grade}</b> · `:'')+
+        `carrier <b>${q.carrier_snr_db} dB</b>`+
+        ` · audio SNR ${q.audio_snr_db!=null?q.audio_snr_db:'—'} dB`+
         ` · co-channel ${q.cochannel}`+
         ` · fades ${(q.fade_frac6*100).toFixed(0)}%`+
         ` · BW ${(q.cutoff_hz/1000).toFixed(1)} kHz`+

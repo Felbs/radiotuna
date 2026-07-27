@@ -141,7 +141,15 @@ def _adaptive_cutoff(y, fs, state):
     prev = state.get("cutoff", cut)
     cut = 0.6 * prev + 0.4 * cut          # no per-chunk bandwidth flapping
     state["cutoff"] = cut
-    return cut
+    # honest audio SNR: program power over noise, averaged across the
+    # voice band actually kept (the same physics the cutoff came from)
+    vb = (fp > 300) & (fp < max(cut, CUT_MIN))
+    if vb.any():
+        prog = np.maximum(smooth[vb] - 2 * N0, 2 * N0 * 1e-3)
+        asnr = float(10 * np.log10(np.mean(prog) / (2 * N0)))
+    else:
+        asnr = 0.0
+    return cut, asnr
 
 
 def best_chunk(x, fs, state=None, rescue=True):
@@ -216,8 +224,9 @@ def best_chunk(x, fs, state=None, rescue=True):
 
     # 3. adaptive bandwidth (measured on the carrier-locked CHANNEL, where
     # out-of-channel noise density is observable)
-    cut = _adaptive_cutoff(y, fs, state)
+    cut, audio_snr = _adaptive_cutoff(y, fs, state)
     diag["cutoff_hz"] = int(cut)
+    diag["audio_snr_db"] = round(audio_snr, 1)
     a = filtfilt(firwin(257, cut / (fs / 2)), [1.0], a).astype(np.float32)
 
     # 5. Wiener NR on the pause floor
@@ -240,6 +249,20 @@ def best_chunk(x, fs, state=None, rescue=True):
     state["agc"] = float(smooth[-1])
     a = np.clip(a * (0.25 / np.maximum(smooth, 1e-4)), -0.95, 0.95)
     diag["level"] = round(float(np.sqrt(np.mean(a ** 2))), 3)
+
+    # the AUDIO QUALITY score - the STVT watchability law on radio:
+    # quality = delivery x (1 - errors), every term measured above.
+    # base: sigmoid on honest audio SNR (5 dB ~ 19, 15 ~ 50, 25 ~ 81)
+    base = 100.0 / (1.0 + np.exp(-(audio_snr - 15.0) / 7.0))
+    delivery = 1.0 - min(1.0, diag["fade_frac6"] * 2.5)   # fades steal words
+    fidelity = 0.85 + 0.15 * (cut / CUT_MAX)              # bandwidth = warmth
+    q = base * delivery * fidelity
+    q -= (14 if ncoch >= 3 else 6 if ncoch == 2 else 0)   # audible neighbors
+    q -= 2 * len(hets)                                    # notched, scarred
+    q = int(np.clip(q, 0, 100))
+    diag["quality"] = q
+    diag["grade"] = ("EXCELLENT" if q >= 75 else "GOOD" if q >= 55 else
+                     "FAIR" if q >= 35 else "ROUGH" if q >= 18 else "STATIC")
     return a.astype(np.float32), diag
 
 
@@ -393,6 +416,17 @@ def cmd_selftest():
     print(f"  F 1350Hz het    : excisor found {d6['hets_hz']} Hz, "
           f"cut {cut6:.1f} dB")
     ok &= bool(found) and cut6 > 10
+
+    # G. the quality metric must rank like an ear: clean wideband >
+    # hissy > deep-faded, with sane absolute placements
+    _bq, dq_clean = best_chunk(ycl2.copy(), fs, rescue=False)
+    _bq2, dq_hiss = best_chunk(yn.copy(), fs, rescue=False)
+    _bq3, dq_fade = best_chunk(y.copy(), fs, rescue=False)
+    print(f"  G quality metric: clean {dq_clean['quality']} ({dq_clean['grade']})"
+          f"  hissy {dq_hiss['quality']} ({dq_hiss['grade']})"
+          f"  faded {dq_fade['quality']} ({dq_fade['grade']})")
+    ok &= (dq_clean["quality"] > dq_hiss["quality"] > dq_fade["quality"]
+           and dq_clean["quality"] >= 70 and dq_fade["quality"] <= 45)
 
     print("=" * 64)
     print("SELFTEST", "PASS" if ok else "FAIL")
