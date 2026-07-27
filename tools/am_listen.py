@@ -163,7 +163,12 @@ def main():
             with open(raw_path, "ab") as f:
                 f.write(pcm)             # the cast tails this file
             aud_ring.append(np.clip(audio, -1, 1).astype(np.float32))
-            if len(aud_ring) == 3 and not whisper_busy.is_set():
+            # the AI EAR is an option, not a mandate: a flag file turns
+            # it off instantly (no GPU, no restart needed)
+            whisper_on = not (LAB / "whisper_off.flag").exists()
+            if not whisper_on:
+                whisper_out.clear()
+            if whisper_on and len(aud_ring) == 3 and not whisper_busy.is_set():
                 whisper_busy.set()
                 threading.Thread(target=transcribe_ring,
                                  daemon=True).start()

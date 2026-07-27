@@ -1951,6 +1951,7 @@ rgba(0,229,255,.35);border-radius:6px;margin:10px 0;padding:8px">
     <button class="ambtn" onclick="bandStop()">■ STOP</button>
     <button class="ambtn" onclick="castToggle('am')">🔊 CAST TO WI-FI SPEAKERS</button>
     <button class="ambtn" onclick="dxLog('am')">📖 DX LOG</button>
+    <button class="ambtn" id="am-ear" onclick="earToggle()">🗣 AI EAR: …</button>
     <button class="ambtn" id="am-sort" onclick="cycleSort('am')">⇅ SORT: SIGNAL</button>
     <span id="am-status" style="margin-left:10px;color:#8a6a45"></span>
   </div>
@@ -1987,6 +1988,7 @@ rgba(0,229,255,.35);border-radius:6px;margin:10px 0;padding:8px">
     <button class="swbtn" onclick="bandStop()">■ STOP</button>
     <button class="swbtn" onclick="castToggle('sw')">🔊 CAST TO WI-FI SPEAKERS</button>
     <button class="swbtn" onclick="dxLog('sw')">📖 DX LOG</button>
+    <button class="swbtn" id="sw-ear" onclick="earToggle()">🗣 AI EAR: …</button>
     <button class="swbtn" id="sw-sort" onclick="cycleSort('sw')">⇅ SORT: SIGNAL</button>
     <span id="sw-status" style="margin-left:10px;color:#8a7f60"></span>
     <div id="sw-quality" style="display:none;font-size:12px;color:#cfc4a0;
@@ -2036,6 +2038,18 @@ function rateBand(dk){_scanPost('/api/band/rate',{deck:dk},dk+'-status',
   'rating the top 40 by ear — ~2 min…');}
 function autoTune(dk){_scanPost('/api/band/autotune',{deck:dk},dk+'-status',
   'auto-tune: finding the best-sounding station…');}
+let EAR_ON=true;
+function earToggle(){
+  EAR_ON=!EAR_ON;
+  post('/api/whisper',{on:EAR_ON});
+  earLabel();
+}
+function earLabel(){
+  for(const id of ['am-ear','sw-ear']){
+    const el=document.getElementById(id);
+    if(el)el.textContent='🗣 AI EAR: '+(EAR_ON?'ON':'OFF');
+  }
+}
 const SORT={am:'db',sw:'db',fm:'mhz'};
 const SORT_LABEL={db:'⇅ SORT: SIGNAL',khz:'⇅ SORT: FREQUENCY',
   mhz:'⇅ SORT: FREQUENCY',q:'⇅ SORT: QUALITY'};
@@ -2150,6 +2164,8 @@ function renderProgress(B){
 }
 let _listenT0=0;
 function renderQuality(B){
+  if(B.whisper_on!=null&&B.whisper_on!==EAR_ON){EAR_ON=B.whisper_on;}
+  earLabel();
   renderProgress(B);
   const q=B.quality;
   for(const [dk,id] of [['am','am-quality'],['sw','sw-quality']]){
@@ -2663,6 +2679,7 @@ class H(BaseHTTPRequestHandler):
             b = {k: BAND.get(k) for k in
                  ("am_stations", "sw_stations", "sw_band", "am_hd",
                   "deck", "khz", "scanning", "scan_spec")}
+            b["whisper_on"] = not (LAB / "whisper_off.flag").exists()
             for dk in ("am", "sw"):    # grid staleness: SW turns over at
                 try:                   # UTC hour marks — say how old it is
                     b[dk + "_age_s"] = int(
@@ -2783,6 +2800,16 @@ class H(BaseHTTPRequestHandler):
                 return
             threading.Thread(target=sw_scan_all, daemon=True).start()
             self._send('"scanning"')
+        elif self.path == "/api/whisper":
+            flag = LAB / "whisper_off.flag"
+            if req.get("on"):
+                try:
+                    flag.unlink()
+                except OSError:
+                    pass
+            else:
+                flag.write_text("off")
+            self._send('"ok"')
         elif self.path == "/api/band/rate":
             if BAND.get("scanning"):
                 self._send('"busy"')
