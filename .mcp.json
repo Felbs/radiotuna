@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "radiotuna": {
+      "command": "python",
+      "args": ["tools/radiotuna_mcp.py"]
+    }
+  }
+}
