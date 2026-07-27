@@ -890,6 +890,9 @@ def autotune(deck):
     rated = sorted((s for s in BAND[key] if s.get("q")
                     and s.get("mode") in listenable),
                    key=lambda s: -s["q"])
+    if not rated:                # a wrong mode tag must never mean silence
+        rated = sorted((s for s in BAND[key] if s.get("q")),
+                       key=lambda s: -s["q"])
     for s in rated[:4]:
         band_listen(deck, s["khz"])
         time.sleep(16)                   # two chunks of live verdict
