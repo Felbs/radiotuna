@@ -871,14 +871,30 @@ def rate_band(deck, top=40):
 
 def autotune(deck):
     """One click to the best-sounding station: rate the band if it has
-    no ratings yet, then tune the highest AUDIO QUALITY row."""
+    no ratings yet, then walk the quality ranking - tune, LISTEN for
+    two chunks, and fall back to the next candidate if the station
+    died since it was rated (shortwave ratings age in minutes; the
+    first autotune picked a 19m carrier that collapsed 90 s later)."""
     key = "am_stations" if deck == "am" else "sw_stations"
     if not any(s.get("q") is not None for s in BAND[key]):
         rate_band(deck)
-    rated = [s for s in BAND[key] if s.get("q") is not None]
-    if rated:
-        best = max(rated, key=lambda s: s["q"])
-        band_listen(deck, best["khz"])
+    rated = sorted((s for s in BAND[key] if s.get("q")),
+                   key=lambda s: -s["q"])
+    for s in rated[:4]:
+        band_listen(deck, s["khz"])
+        time.sleep(16)                   # two chunks of live verdict
+        try:
+            q = json.loads((LAB / "band_quality.json").read_text())
+            if (q.get("khz") == s["khz"]
+                    and q.get("quality") is not None
+                    and q["quality"] >= 25):
+                s["q"], s["grade"] = q["quality"], q["grade"]
+                return                   # verified alive - keep it
+            if q.get("quality") is not None:
+                s["q"], s["grade"] = q["quality"], q["grade"]
+        except (OSError, ValueError):
+            pass
+    # nothing verified: stay on the last candidate rather than silence
 
 
 def band_listen(deck, khz):
