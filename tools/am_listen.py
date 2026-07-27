@@ -124,6 +124,30 @@ def main():
 
     state = {}
     chunks_done = 0
+    # live Whisper: a background thread transcribes the rolling last
+    # ~18 s on the GPU; results ride the next truth-dial publish
+    from collections import deque
+    aud_ring = deque(maxlen=3)
+    whisper_out = {}
+    whisper_busy = threading.Event()
+
+    def transcribe_ring():
+        try:
+            import intelligibility as intel
+            from scipy.signal import resample_poly as rp
+            a = np.concatenate(list(aud_ring))
+            a16 = rp(a, 2, 3).astype(np.float32)     # 24k -> 16k
+            r = intel.analyze(a16)
+            whisper_out.update(
+                intell=r["score"], lang=r["language"],
+                lang_p=r["lang_prob"],
+                transcript=r["text"][-220:],
+                spoken_ids=r["ids"])
+        except Exception:
+            pass
+        finally:
+            whisper_busy.clear()
+
     try:
         while True:
             iq = iq_q.get()
@@ -138,6 +162,13 @@ def main():
             pcm = (np.clip(audio, -1, 1) * 32000).astype(np.int16).tobytes()
             with open(raw_path, "ab") as f:
                 f.write(pcm)             # the cast tails this file
+            aud_ring.append(np.clip(audio, -1, 1).astype(np.float32))
+            if len(aud_ring) == 3 and not whisper_busy.is_set():
+                whisper_busy.set()
+                threading.Thread(target=transcribe_ring,
+                                 daemon=True).start()
+            if whisper_out:
+                diag.update(whisper_out)
             chunks_done += 1
             if args.play and player is None:
                 player = spawn_player()  # first chunk primes the pipe

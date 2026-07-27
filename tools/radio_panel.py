@@ -855,6 +855,12 @@ def rate_band(deck, top=40):
                     _a, d = am_best.best_chunk(x, 20_000, rescue=False)
                     s["q"], s["grade"] = d["quality"], d["grade"]
                     s["q_ts"] = time.time()
+                    try:
+                        import mod_classify
+                        label, conf, _f = mod_classify.classify(x, 20_000)
+                        s["mode"] = label
+                    except Exception:
+                        pass
                 except Exception:
                     s["q"], s["grade"] = 0, "STATIC"
                     s["q_ts"] = time.time()
@@ -880,7 +886,9 @@ def autotune(deck):
     key = "am_stations" if deck == "am" else "sw_stations"
     if not any(s.get("q") is not None for s in BAND[key]):
         rate_band(deck)
-    rated = sorted((s for s in BAND[key] if s.get("q")),
+    listenable = ("AM-VOICE", "AM-MUSIC", None)
+    rated = sorted((s for s in BAND[key] if s.get("q")
+                    and s.get("mode") in listenable),
                    key=lambda s: -s["q"])
     for s in rated[:4]:
         band_listen(deck, s["khz"])
@@ -2043,14 +2051,19 @@ function sortRows(dk,rows){
   else r.sort((a,b)=>b.db-a.db);
   return r;
 }
+const MODE_COL={'AM-VOICE':'#7dc87d','AM-MUSIC':'#7db8c8','CW/KEYED':'#c8b87d',
+  'DATA':'#c87d7d','CARRIER':'#8a8a8a','NOISE':'#6a6a6a','JAMMER?':'#c85d5d'};
 function qBadge(s){
-  if(s.q==null)return '';
+  let mode='';
+  if(s.mode)mode=` <span style="font-size:9px;border:1px solid ${MODE_COL[s.mode]||'#888'};`+
+    `color:${MODE_COL[s.mode]||'#888'};border-radius:3px;padding:0 3px">${s.mode}</span>`;
+  if(s.q==null)return mode;
   const c=s.q>=75?'#7dc87d':s.q>=55?'#c8b87d':s.q>=35?'#c8987d':'#c87d7d';
   const age=s.q_ts?Math.round((Date.now()/1000-s.q_ts)/60):null;
   const stale=age!=null&&age>25;   // SW conditions turn over in minutes
   const tip=`${s.grade}${age!=null?` — rated ${age} min ago`:''}${stale?' (STALE — conditions have moved on, re-rate)':''}`;
   return `<span title="${tip}" style="color:${c};font-weight:bold;`+
-    `${stale?'opacity:.45;font-style:italic':''}"> ★${s.q}${stale?'?':''}</span>`;
+    `${stale?'opacity:.45;font-style:italic':''}"> ★${s.q}${stale?'?':''}</span>`+mode;
 }
 function swScan(){_scanPost('/api/sw/scan',{band:SW_BAND},'sw-status','scanning '+SW_BAND+'…');}
 function swScanAll(){_scanPost('/api/sw/scan_all',null,'sw-status','world tour: sweeping 49m→16m…');}
@@ -2162,7 +2175,11 @@ function renderQuality(B){
         ` · fades ${(q.fade_frac6*100).toFixed(0)}%`+
         ` · BW ${(q.cutoff_hz/1000).toFixed(1)} kHz`+
         (q.hets_hz&&q.hets_hz.length?` · het notched @ ${q.hets_hz.join(', ')} Hz`:'')+
-        ` · sideband tilt ${q.tilt_db>0?'+':''}${q.tilt_db} dB`;
+        ` · sideband tilt ${q.tilt_db>0?'+':''}${q.tilt_db} dB`+
+        (q.intell!=null?`<br>🗣 UNDERSTOOD <b>${q.intell}/100</b>`+
+          ` · ${q.lang} (p=${q.lang_p})`+
+          (q.spoken_ids&&q.spoken_ids.length?` · heard ID: ${q.spoken_ids.join('; ')}`:'')+
+          (q.transcript?`<br><span style="opacity:.65;font-style:italic">“…${q.transcript}”</span>`:''):'');
       drawBandWF(dk,q);
     } else el.style.display='none';
   }
