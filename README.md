@@ -90,3 +90,35 @@ GNU Radio out-of-tree module lineage (sibling of gr-atscplus in the TV
 Tuna repo). Decoder families will live under one namespace as blocks:
 `radiotuna.hd_*`, `radiotuna.sat_*`, `radiotuna.ais_*` — whimsy on the
 marquee, discipline in the API.
+
+## Acknowledgments & prior art
+Radio Tuna stands on ideas (and in some cases shoulders-of-giants code)
+from the wider SDR community — credit where it's due:
+
+- **[ka9q-radio](https://github.com/ka9q/ka9q-radio)** (Phil Karn,
+  KA9Q) — `whole_band.py`'s demodulate-every-channel-at-once approach
+  is our independent reimplementation of his fast-convolution
+  multichannel architecture. The idea that one wideband capture can be
+  *every* station simultaneously is his; go see the original, it's a
+  masterwork.
+- **[nrsc5](https://github.com/theori-io/nrsc5)** (Theori, and
+  **argilo**'s MA3 all-digital AM work) — our HD Radio engine
+  [albacore](https://github.com/Felbs/albacore) is an instrumented
+  fork of nrsc5; all decode capability originates there.
+- **[rtl-ml](https://github.com/TrevTron/rtl-ml)** (TrevTron) —
+  `mod_classify.py`'s per-carrier signal classification was inspired
+  by this project's edge-hardware classifier; ours swaps the trained
+  model for explainable physics rules, but the "classify what you
+  scanned" idea came from there.
+- **[gr-mcp](https://github.com/yoelbassin/gr-mcp)** (yoelbassin) and
+  Paul David's GRCon25 *Powering Cognitive Radios with LLMs* —
+  `radiotuna_mcp.py` follows the LLM-orchestrates/DSP-stays-
+  deterministic framing they articulated for GNU Radio.
+- **[faster-whisper](https://github.com/SYSTRAN/faster-whisper)** /
+  OpenAI Whisper — the AI EAR's speech recognition; the idea of
+  pointing Whisper at demodulated radio audio circulates in the
+  DragonOS community.
+- **[EiBi](http://www.eibispace.de/)** (Eike Bierwirth) — the
+  shortwave schedule database behind every "who's on the air" ident.
+- **FCC AM Query** — the public licensing data behind medium-wave
+  identification.
