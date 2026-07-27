@@ -1945,6 +1945,12 @@ rgba(0,229,255,.35);border-radius:6px;margin:10px 0;padding:8px">
     border:1px dashed rgba(255,180,87,.4);border-radius:6px;font-size:12px"></div>
   <div id="am-hdbox">HD-AM: tune a station, then TRY HD — the 820 WSHE catch
     wants midday (4.3 kW day vs 430 W night).</div>
+  <div style="font-size:11px;color:#8a6a45;margin-bottom:4px">
+    ★ = rated by ear (<span style="color:#7dc87d">■</span> excellent
+    <span style="color:#c8b87d">■</span> good
+    <span style="color:#c8987d">■</span> fair
+    <span style="color:#c87d7d">■</span> skip) · no star = not auditioned yet — RATE tests the 40 strongest
+  </div>
   <table><thead><tr><th>kHz</th><th>signal</th><th>who's there</th>
     <th></th><th></th></tr></thead><tbody id="am-rows">
     <tr><td colspan="5" style="color:#8a6a45">scan to light the dial…</td></tr>
@@ -1979,6 +1985,12 @@ rgba(0,229,255,.35);border-radius:6px;margin:10px 0;padding:8px">
   </div>
   <div id="sw-sched" style="display:none;margin-bottom:10px;padding:10px;
     border:1px dashed rgba(200,180,130,.4);border-radius:6px;font-size:12px"></div>
+  <div style="font-size:11px;color:#8a7f60;margin-bottom:4px">
+    ★ = rated by ear (<span style="color:#7dc87d">■</span> excellent
+    <span style="color:#c8b87d">■</span> good
+    <span style="color:#c8987d">■</span> fair
+    <span style="color:#c87d7d">■</span> skip) · no star = not auditioned yet — RATE tests the 40 strongest
+  </div>
   <table><thead><tr><th>kHz</th><th>signal</th><th>on air now (EiBi)</th>
     <th></th></tr></thead><tbody id="sw-rows">
     <tr><td colspan="4" style="color:#8a7f60">pick a band, scan the world…</td></tr>
