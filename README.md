@@ -101,10 +101,11 @@ from the wider SDR community — credit where it's due:
   multichannel architecture. The idea that one wideband capture can be
   *every* station simultaneously is his; go see the original, it's a
   masterwork.
-- **[nrsc5](https://github.com/theori-io/nrsc5)** (Theori, and
-  **argilo**'s MA3 all-digital AM work) — our HD Radio engine
-  [albacore](https://github.com/Felbs/albacore) is an instrumented
-  fork of nrsc5; all decode capability originates there.
+- **[nrsc5](https://github.com/theori-io/nrsc5)** (Theori, with
+  **argilo**'s MA3 all-digital AM implementation) — every bit of HD
+  Radio decode capability in this project comes from nrsc5. Our
+  [albacore](https://github.com/Felbs/albacore) is merely an
+  instrumented fork of it: their decoder, our extra dials.
 - **[rtl-ml](https://github.com/TrevTron/rtl-ml)** (TrevTron) —
   `mod_classify.py`'s per-carrier signal classification was inspired
   by this project's edge-hardware classifier; ours swaps the trained
