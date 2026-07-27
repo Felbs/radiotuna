@@ -2091,10 +2091,16 @@ function pollBand(){
     }
     if(CUR_DECK==='sw'){
       const liveSW=B.quality&&B.quality.deck==='sw';
-      document.getElementById('sw-status').textContent=B.scanning?
+      let swTxt=B.scanning?
         ('scanning '+B.sw_band+'… ('+B.sw_stations.length+' so far)'):
         liveSW?('● LIVE '+(+B.khz).toFixed(0)+' kHz'):
         (B.sw_stations.length? B.sw_stations.length+' carriers':'');
+      if(!B.scanning&&!liveSW&&B.sw_age_s!=null&&B.sw_stations.length){
+        const m=Math.round(B.sw_age_s/60);
+        swTxt+=' · scanned '+(m<60?m+' min':Math.round(m/60)+' h')+' ago';
+        if(B.sw_age_s>2400)swTxt+=' — schedules turn over on UTC hour marks, rescan';
+      }
+      document.getElementById('sw-status').textContent=swTxt;
       if(B.scanning&&B.sw_band){SW_BAND=B.sw_band;
         document.querySelectorAll('.swband').forEach(e=>
           e.classList.toggle('on', e.dataset.b===B.sw_band));}
@@ -2498,6 +2504,12 @@ class H(BaseHTTPRequestHandler):
             b = {k: BAND.get(k) for k in
                  ("am_stations", "sw_stations", "sw_band", "am_hd",
                   "deck", "khz", "scanning", "scan_spec")}
+            for dk in ("am", "sw"):    # grid staleness: SW turns over at
+                try:                   # UTC hour marks — say how old it is
+                    b[dk + "_age_s"] = int(
+                        time.time() - (LAB / f"{dk}_stations.json").stat().st_mtime)
+                except OSError:
+                    pass
             if BAND.get("scanning") and BAND.get("scan_t0"):
                 el = time.time() - BAND["scan_t0"]
                 eta = max(1.0, BAND.get("scan_eta", 25))
