@@ -727,6 +727,48 @@ def dx_summary():
                      for d, k, i, dk in top]}
 
 
+def atlas_summary():
+    """Propagation Observatory read-out (prop_atlas.py phase 2): last
+    sweep, per-band alive counts, best channels of the last 24 h.
+    Read-only and defensive - a missing or locked db must NEVER take
+    the panel down."""
+    out = {"ok": False}
+    db = LAB / "prop_atlas.db"
+    try:
+        if not db.exists():
+            out["err"] = "no atlas db yet"
+            return out
+        import sqlite3
+        from datetime import timedelta, timezone as _tz
+        cx = sqlite3.connect(f"file:{db.as_posix()}?mode=ro", uri=True,
+                             timeout=2.0)
+        try:
+            last = cx.execute(
+                "SELECT MAX(ts_utc) FROM sweeps").fetchone()[0]
+            bands = []
+            if last:
+                bands = [{"band": b, "n_channels": nc, "n_alive": na}
+                         for b, nc, na in cx.execute(
+                             "SELECT band, n_channels, n_alive "
+                             "FROM sweeps WHERE ts_utc=?", (last,))]
+            day = (datetime.now(_tz.utc) - timedelta(days=1)
+                   ).strftime("%Y-%m-%dT%H:%M:%SZ")
+            top = [{"khz": k, "band": b, "q": q, "grade": g,
+                    "expected": e}
+                   for k, b, q, g, e in cx.execute(
+                       "SELECT khz, band, MAX(q), grade, expected "
+                       "FROM scans WHERE ts_utc >= ? AND q IS NOT NULL "
+                       "GROUP BY khz ORDER BY 3 DESC LIMIT 10", (day,))]
+            out.update(ok=True, last_sweep=last, bands=bands, top=top,
+                       scan_rows=cx.execute(
+                           "SELECT COUNT(*) FROM scans").fetchone()[0])
+        finally:
+            cx.close()
+    except Exception as e:
+        out["err"] = str(e)
+    return out
+
+
 def _scan_begin(eta_s):
     """Take the radio for a scan: refuse if a scan is already running,
     yield any live listener (single-tenant SDR), start the progress
@@ -2752,6 +2794,9 @@ class H(BaseHTTPRequestHandler):
             return
         elif self.path == "/api/dx/summary":
             self._send(json.dumps(dx_summary()))
+            return
+        elif self.path == "/api/atlas":
+            self._send(json.dumps(atlas_summary()))
             return
         elif self.path.startswith("/api/sw/sched"):
             from urllib.parse import urlparse, parse_qs

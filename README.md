@@ -70,6 +70,7 @@ fills as the tools run.
 | `rds.py` | FM RDS decoder — stations name themselves |
 | `hf_knob.py` | The ionosphere clock: FT8 + shortwave band-openness curves, learned hourly |
 | `am_night.py` | AM broadcast scanner (the skywave story, night vs day) |
+| `prop_atlas.py` | **Propagation Observatory**: 24/7 AM+SW band-health atlas — half-hourly every-channel quality sweeps, EiBi heard-vs-scheduled join, durable SQLite rollups |
 | `ais.py` | AIS ship tracking on 162 MHz (both channels from one capture) |
 | `drm.py` | DRM digital-shortwave acquisition |
 | `bandscan.py` | 25–1500 MHz classifier with a built-in legality guard (refuses decoders on protected bands by code) |
@@ -79,6 +80,32 @@ Digital audio hiding ~20 dB beneath every big FM station; marginal by
 design; `nrsc5` provides the dial. See `docs/HD_CAMPAIGN.md`.
 Tooling so far: `tools/hd_radio.py` (capture / decode / live listening
 via SDRplay → decimation → nrsc5).
+
+## The Propagation Observatory
+`tools/prop_atlas.py` is the standing band-health atlas: every 30
+minutes it takes one 4-second gulp of medium wave plus the 49/41/31/
+25/19 m shortwave broadcast bands (about 30 s of radio time, at the
+lowest warden priority — it yields to everything and skips the cycle
+if the radio is busy), then channelizes each gulp ka9q-style into a
+quality grade for **every** channel (~570 of them) and stores the lot
+in `lab/prop_atlas.db` (SQLite).
+
+The trick that makes it science rather than a scan log: at insert
+time each shortwave row is joined against the EiBi schedule, so every
+row records both what was *heard* and who was *scheduled* to be there
+at that minute. Heard-vs-scheduled over weeks of half-hour samples is
+a propagation observatory — band openings by hour, season, and
+frequency, measured from your own antenna. An `hourly` view rolls up
+avg quality per channel per UTC hour; `GET /api/atlas` on the panel
+serves the latest sweep.
+
+```bash
+python tools/prop_atlas.py once     # single test sweep
+python tools/prop_atlas.py status   # last sweep, alive counts, top channels
+tools/atlas_start.ps1               # start the 24/7 daemon (detached; Windows)
+```
+(EiBi data is downloaded per-user into `lab/` and never ships with the
+repo — see Acknowledgments.)
 
 ## The map
 Weather satellites (Meteor LRPT, GOES HRIT dish-aiming), AIS ship

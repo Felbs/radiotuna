@@ -123,7 +123,8 @@ def cmd_selftest():
 def cmd_process(args):
     x = np.fromfile(args.cf32, dtype=np.complex64)
     print(f"[whole-band] {len(x)/args.fs:.1f}s from {args.cf32}")
-    centers = [k * 1e3 for k in range(530, 1701, 10)]
+    centers = [k * 1e3 for k in
+               range(args.start_khz, args.stop_khz + 1, args.step_khz)]
     t0 = time.time()
     rows = survey(x, args.fs, args.center, centers)
     print(f"[whole-band] {len(rows)} channels in {time.time()-t0:.1f}s")
@@ -144,6 +145,11 @@ def main():
     p.add_argument("--cf32", required=True)
     p.add_argument("--fs", type=float, default=2e6)
     p.add_argument("--center", type=float, default=1115e3)
+    p.add_argument("--start-khz", type=int, default=530,
+                   help="channel raster start (default MW band)")
+    p.add_argument("--stop-khz", type=int, default=1700)
+    p.add_argument("--step-khz", type=int, default=10,
+                   help="10 kHz MW raster; use 5 for SW broadcast bands")
     args = ap.parse_args()
     sys.exit(cmd_selftest() if args.cmd == "selftest" else cmd_process(args))
 
