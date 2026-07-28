@@ -1952,6 +1952,7 @@ rgba(0,229,255,.35);border-radius:6px;margin:10px 0;padding:8px">
     <button class="ambtn" onclick="castToggle('am')">🔊 CAST TO WI-FI SPEAKERS</button>
     <button class="ambtn" onclick="dxLog('am')">📖 DX LOG</button>
     <button class="ambtn" id="am-ear" onclick="earToggle()">🗣 AI EAR: …</button>
+    <button class="ambtn" onclick="earLog('am')">📜 HEARD</button>
     <button class="ambtn" id="am-sort" onclick="cycleSort('am')">⇅ SORT: SIGNAL</button>
     <span id="am-status" style="margin-left:10px;color:#8a6a45"></span>
   </div>
@@ -1960,6 +1961,8 @@ rgba(0,229,255,.35);border-radius:6px;margin:10px 0;padding:8px">
     <div style="width:0%;height:100%;background:#c8863f;transition:width .8s"></div>
   </div>
   <div id="am-dx" style="display:none;margin-bottom:10px;padding:10px;
+    border:1px dashed rgba(255,180,87,.4);border-radius:6px;font-size:12px"></div>
+  <div id="am-earlog" style="display:none;margin-bottom:10px;padding:10px;
     border:1px dashed rgba(255,180,87,.4);border-radius:6px;font-size:12px"></div>
   <div id="am-hdbox">HD-AM: tune a station, then TRY HD — the 820 WSHE catch
     wants midday (4.3 kW day vs 430 W night).</div>
@@ -1989,6 +1992,7 @@ rgba(0,229,255,.35);border-radius:6px;margin:10px 0;padding:8px">
     <button class="swbtn" onclick="castToggle('sw')">🔊 CAST TO WI-FI SPEAKERS</button>
     <button class="swbtn" onclick="dxLog('sw')">📖 DX LOG</button>
     <button class="swbtn" id="sw-ear" onclick="earToggle()">🗣 AI EAR: …</button>
+    <button class="swbtn" onclick="earLog('sw')">📜 HEARD</button>
     <button class="swbtn" id="sw-sort" onclick="cycleSort('sw')">⇅ SORT: SIGNAL</button>
     <span id="sw-status" style="margin-left:10px;color:#8a7f60"></span>
     <div id="sw-quality" style="display:none;font-size:12px;color:#cfc4a0;
@@ -2001,6 +2005,8 @@ rgba(0,229,255,.35);border-radius:6px;margin:10px 0;padding:8px">
       max-width:700px;margin:6px auto;border:1px solid rgba(200,180,130,.25);
       border-radius:4px;image-rendering:pixelated"></canvas>
     <div id="sw-dx" style="display:none;margin-top:8px;padding:10px;
+      border:1px dashed rgba(200,180,130,.4);border-radius:6px;font-size:12px"></div>
+    <div id="sw-earlog" style="display:none;margin-top:8px;padding:10px;
       border:1px dashed rgba(200,180,130,.4);border-radius:6px;font-size:12px"></div>
   </div>
   <div id="sw-sched" style="display:none;margin-bottom:10px;padding:10px;
@@ -2163,6 +2169,37 @@ function renderProgress(B){
   }
 }
 let _listenT0=0;
+// ---- AI EAR logbook: everything Whisper understood this session ----------
+let _earLog=[],_earLast='';
+function earCapture(dk,q){
+  if(!q||q.intell==null||!q.transcript||q.transcript===_earLast)return;
+  _earLast=q.transcript;
+  _earLog.unshift({t:new Date().toLocaleTimeString([], {hour:'2-digit',minute:'2-digit'}),
+    dk,khz:q.khz!=null?q.khz:null,lang:q.lang||'?',intell:q.intell,
+    ids:(q.spoken_ids||[]).join('; '),txt:q.transcript});
+  if(_earLog.length>40)_earLog.pop();
+  const box=document.getElementById(dk+'-earlog');
+  if(box&&box.style.display==='block')earLogRender(dk);
+}
+function earLogRender(dk){
+  const box=document.getElementById(dk+'-earlog');
+  const rows=_earLog.filter(e=>e.dk===dk);
+  const hue=dk==='am'?'#ffcf87':'#e8dcb8';
+  box.innerHTML=`<b style="color:${hue}">📜 HEARD THIS SESSION — the AI ear's logbook</b>`+
+    `<div style="font-size:11px;margin:2px 0 6px 0;opacity:.7">rolling transcript log · `+
+    `UNDERSTOOD is duration-weighted decode confidence, not a content score</div>`+
+    (rows.length?rows.map(e=>
+      `<div style="margin-bottom:5px"><span style="opacity:.6">${e.t}</span>`+
+      (e.khz?` <b>${e.khz} kHz</b>`:'')+` · ${e.lang} · ${e.intell}/100`+
+      (e.ids?` · <b>ID: ${e.ids}</b>`:'')+
+      `<br><span style="opacity:.75;font-style:italic">“…${e.txt}”</span></div>`).join('')
+     :`<span style="opacity:.6">nothing understood yet — tune a talk station and let it listen</span>`);
+}
+function earLog(dk){
+  const box=document.getElementById(dk+'-earlog');
+  if(box.style.display==='block'){box.style.display='none';return;}
+  box.style.display='block';earLogRender(dk);
+}
 function renderQuality(B){
   if(B.whisper_on!=null&&B.whisper_on!==EAR_ON){EAR_ON=B.whisper_on;}
   earLabel();
@@ -2196,9 +2233,11 @@ function renderQuality(B){
         (q.hets_hz&&q.hets_hz.length?` · het notched @ ${q.hets_hz.join(', ')} Hz`:'')+
         ` · sideband tilt ${q.tilt_db>0?'+':''}${q.tilt_db} dB`+
         (q.intell!=null?`<br>🗣 UNDERSTOOD <b>${q.intell}/100</b>`+
-          ` · ${q.lang} (p=${q.lang_p})`+
+          ` · ${q.lang}${q.lang_p!=null?' '+Math.round(q.lang_p*100)+'%':''}`+
           (q.spoken_ids&&q.spoken_ids.length?` · heard ID: ${q.spoken_ids.join('; ')}`:'')+
-          (q.transcript?`<br><span style="opacity:.65;font-style:italic">“…${q.transcript}”</span>`:''):'');
+          (q.transcript?`<br><span style="opacity:.65;font-style:italic">“…${q.transcript}”</span>`:'')
+         :(EAR_ON?`<br>🗣 <span style="opacity:.6">AI EAR listening — first verdict ~20 s after audio starts</span>`:''));
+      earCapture(dk,q);
       drawBandWF(dk,q);
     } else el.style.display='none';
   }
