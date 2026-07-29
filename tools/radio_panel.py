@@ -769,6 +769,53 @@ def atlas_summary():
     return out
 
 
+def iono_summary():
+    """ionoTuna deck feed (2026-07-28): band doors from the prop atlas
+    (last sweep + 24 h alive-count sparklines per band) plus the storm
+    watch's lab/iono_state.json verbatim. Read-only and defensive -
+    a missing db, a locked db, or no storm_watch yet must NEVER take
+    the panel down: worst case {ok: False}."""
+    out = {"ok": False}
+    try:
+        bands = []
+        db = LAB / "prop_atlas.db"
+        if db.exists():
+            import sqlite3
+            from datetime import timedelta, timezone as _tz
+            cx = sqlite3.connect(f"file:{db.as_posix()}?mode=ro", uri=True,
+                                 timeout=2.0)
+            try:
+                day = (datetime.now(_tz.utc) - timedelta(days=1)
+                       ).strftime("%Y-%m-%dT%H:%M:%SZ")
+                rows = cx.execute(
+                    "SELECT ts_utc, band, n_channels, n_alive FROM sweeps "
+                    "WHERE ts_utc >= ? ORDER BY ts_utc", (day,)).fetchall()
+            finally:
+                cx.close()
+            per = {}
+            for ts, b, nc, na in rows:
+                per.setdefault(b, []).append((ts, nc, na))
+            for b in ("MW", "49m", "41m", "31m", "25m", "19m"):
+                h = per.get(b)
+                if not h:
+                    continue
+                ts, nc, na = h[-1]
+                bands.append({"band": b, "n_channels": nc, "n_alive": na,
+                              "last": ts,
+                              "spark": [x[2] for x in h][-48:],
+                              "max24": max(x[2] for x in h)})
+        state = None
+        try:
+            state = json.loads((LAB / "iono_state.json"
+                                ).read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            state = None
+        out.update(ok=True, bands=bands, state=state)
+    except Exception as e:
+        out["err"] = str(e)
+    return out
+
+
 def _scan_begin(eta_s):
     """Take the radio for a scan: refuse if a scan is already running,
     yield any live listener (single-tenant SDR), start the progress
@@ -1900,6 +1947,42 @@ box-shadow:0 0 8px rgba(184,72,63,.3)}
 background:linear-gradient(90deg,#4a3f28,#d8c690);
 border-radius:1px;vertical-align:middle;
 box-shadow:inset 0 -1px 0 rgba(0,0,0,.5)}
+/* ── IONO deck — aurora observatory (ionoTuna 2026-07-28) ── */
+.decktab.iono.on{color:#58ffb0;border-color:rgba(88,255,176,.6);
+text-shadow:0 0 10px rgba(88,255,176,.7)}
+#cab-iono{max-width:980px;margin:0 auto;padding:20px;border-radius:8px;
+background:radial-gradient(ellipse at 50% -10%,rgba(20,80,55,.5),rgba(3,10,7,.96) 65%),#04120c;
+border:1px solid rgba(88,255,176,.35);
+box-shadow:0 0 26px rgba(88,255,176,.10),inset 0 0 70px rgba(0,0,0,.6);
+color:#bfe8d4;font-family:Consolas,monospace}
+#cab-iono h2{margin:0;color:#58ffb0;letter-spacing:4px;font-size:20px;
+text-shadow:0 0 14px rgba(88,255,176,.8),0 0 44px rgba(40,200,120,.3)}
+#cab-iono .sub{color:#4f8a6f}
+#io-strip{margin:12px 0;padding:8px 12px;border:1px solid rgba(88,255,176,.3);
+border-radius:6px;background:rgba(88,255,176,.04);font-size:13px;
+display:flex;gap:18px;flex-wrap:wrap;align-items:baseline}
+#io-strip .k{font-size:10px;color:#4f8a6f;letter-spacing:2px}
+#io-strip .v{font-size:16px;color:#58ffb0;text-shadow:0 0 8px rgba(88,255,176,.4)}
+#io-grid{display:flex;gap:14px;flex-wrap:wrap;align-items:stretch}
+.io-box{border:1px solid rgba(88,255,176,.25);border-radius:6px;
+background:rgba(4,20,13,.7);padding:10px;flex:1;min-width:280px}
+.io-h{font-size:10px;color:#4f8a6f;letter-spacing:2px;margin-bottom:8px}
+#io-doorrow{display:flex;gap:10px;align-items:flex-end;justify-content:space-around}
+.io-door{text-align:center;font-size:11px;color:#bfe8d4}
+.io-frame{position:relative;width:44px;height:130px;margin:0 auto 4px;
+background:#02120a;border:1px solid rgba(88,255,176,.35);border-radius:4px 4px 2px 2px;
+overflow:hidden}
+.io-sky{position:absolute;left:2px;right:2px;bottom:2px;border-radius:2px;
+background:linear-gradient(0deg,rgba(88,255,176,.85),rgba(88,255,176,.25));
+box-shadow:0 0 12px rgba(88,255,176,.5);transition:height 1.2s}
+.io-shut{position:absolute;left:0;right:0;top:0;
+background:repeating-linear-gradient(0deg,#0c2418 0 6px,#0a1f14 6px 12px);
+border-bottom:2px solid rgba(88,255,176,.5);transition:height 1.2s}
+.io-cnt{color:#58ffb0;font-size:13px;text-shadow:0 0 8px rgba(88,255,176,.5)}
+.io-sub{color:#4f8a6f;font-size:10px}
+#io-ceil-lbl{text-align:center;font-size:12px;color:#bfe8d4;margin-top:6px}
+#io-rate{font-size:12px;color:#bfe8d4;margin-top:6px}
+.io-grey{color:#4f6a5c;font-style:italic}
 </style></head><body>
 <div id="masthead">
   <div class="brand">RADIO <b>TUNA</b></div>
@@ -1907,6 +1990,7 @@ box-shadow:inset 0 -1px 0 rgba(0,0,0,.5)}
     <div class="decktab fm on" data-deck="fm" onclick="deck('fm')">FM · ALBACORE</div>
     <div class="decktab am" data-deck="am" onclick="deck('am')">AM · NIGHTWAVE</div>
     <div class="decktab sw" data-deck="sw" onclick="deck('sw')">SW · WORLDBAND</div>
+    <div class="decktab iono" data-deck="iono" onclick="deck('iono')">IONO · SKYWATCH</div>
   </div>
 </div>
 <div id="deck-fm" class="deck on"><div id="cabinet">
@@ -2065,6 +2149,33 @@ rgba(0,229,255,.35);border-radius:6px;margin:10px 0;padding:8px">
   </tbody></table>
 </div></div>
 
+<div id="deck-iono" class="deck"><div id="cab-iono">
+  <h2>IONOSPHERE SKYWATCH</h2>
+  <div class="sub">the sky as weather: band doors from the propagation atlas ·
+    ceiling height from lightning tweek dispersion · one antenna = honest range
+    RINGS, distance not bearing</div>
+  <div id="io-strip"><span class="io-grey">reading the sky…</span></div>
+  <div id="io-grid">
+    <div class="io-box" style="flex:1.4">
+      <div class="io-h">BAND DOORS · ALIVE CHANNELS (ATLAS, 30-MIN SWEEPS, LAST 24 H)</div>
+      <div id="io-doorrow"><span class="io-grey">no atlas sweeps yet</span></div>
+      <div class="io-sub" style="margin-top:8px">door openness = alive channels
+        vs that band&rsquo;s best sweep of the last 24 h · sparkline = the diurnal
+        cycle breathing</div>
+    </div>
+    <div class="io-box" style="flex:0.8;min-width:180px;text-align:center">
+      <div class="io-h">CEILING · REFLECTION HEIGHT h = c / (2 f&#8320;)</div>
+      <canvas id="io-gauge" width="150" height="210" style="display:block;margin:0 auto"></canvas>
+      <div id="io-ceil-lbl"><span class="io-grey">no tweek fits yet</span></div>
+    </div>
+    <div class="io-box" style="flex:1.2;min-width:260px;text-align:center">
+      <div class="io-h">STORM RANGES · FITTED TWEEK DISTANCES d = c&middot;D</div>
+      <canvas id="io-map" width="300" height="240" style="display:block;margin:0 auto"></canvas>
+      <div id="io-rate"><span class="io-grey">no fitted storms yet</span></div>
+    </div>
+  </div>
+</div></div>
+
 <script>
 /* ── RADIO TUNA deck switching + AM/SW logic ── */
 let CUR_DECK='fm', SW_BAND='31m';
@@ -2073,7 +2184,8 @@ function deck(d){CUR_DECK=d;
   document.getElementById('deck-'+d).classList.add('on');
   document.querySelectorAll('.decktab').forEach(e=>
     e.classList.toggle('on', e.dataset.deck===d));
-  localStorage.setItem('rt_deck', d);}
+  localStorage.setItem('rt_deck', d);
+  if(d==='iono'&&typeof pollIono==='function')pollIono();}
 function post(u,b){return fetch(u,{method:'POST',
   headers:{'Content-Type':'application/json'},body:JSON.stringify(b||{})});}
 function _scanPost(url,body,el,msg){
@@ -2368,6 +2480,152 @@ function pollBand(){
   }).catch(()=>{});
 }
 setInterval(pollBand, 2500);
+/* ── IONO SKYWATCH deck (ionoTuna 2026-07-28) ──────────────────────────
+   /api/iono only reads files (atlas db + iono_state.json) — a 12 s poll,
+   and only while the deck is showing, hammers nothing. */
+function ioAge(ts){
+  const ms=Date.now()-Date.parse(ts);
+  if(!isFinite(ms))return ts;
+  const m=Math.round(ms/60000);
+  return m<1?'just now':m<60?m+' min ago':(m/60).toFixed(1)+' h ago';
+}
+function ioChip(k,v,col){
+  return `<span><span class="k">${k}</span> <span class="v"`+
+    (col?` style="color:${col};text-shadow:0 0 8px ${col}55"`:'')+
+    `>${v}</span></span>`;
+}
+function renderDoors(bands){
+  const row=document.getElementById('io-doorrow');
+  if(!bands||!bands.length){
+    row.innerHTML='<span class="io-grey">no atlas sweeps in the last 24 h</span>';
+    return;}
+  if(row.childElementCount!==bands.length||!row.querySelector('.io-frame'))
+    row.innerHTML=bands.map(b=>
+      `<div class="io-door" data-band="${b.band}">`+
+      `<div class="io-frame"><div class="io-shut"></div><div class="io-sky"></div></div>`+
+      `<svg class="io-spk" width="56" height="16" viewBox="0 0 56 16"></svg>`+
+      `<div class="io-cnt"></div><div class="io-sub">${b.band}</div></div>`).join('');
+  for(const b of bands){
+    const d=row.querySelector('[data-band="'+b.band+'"]');
+    if(!d)continue;
+    const frac=b.max24>0?Math.min(1,b.n_alive/b.max24):0;
+    const skyH=Math.max(2,Math.round(126*frac));
+    d.querySelector('.io-sky').style.height=skyH+'px';
+    d.querySelector('.io-shut').style.height=(126-skyH)+'px';
+    d.querySelector('.io-cnt').innerHTML=
+      b.n_alive+'<span class="io-sub">/'+b.n_channels+'</span>';
+    d.querySelector('.io-frame').title=
+      b.band+': '+b.n_alive+' of '+b.n_channels+' channels alive · best of 24 h = '+b.max24;
+    const s=b.spark||[];
+    const mx=Math.max(1,...s);
+    const pts=s.map((v,i)=>
+      ((i/Math.max(1,s.length-1))*56).toFixed(1)+','+(15-(v/mx)*14).toFixed(1)).join(' ');
+    d.querySelector('.io-spk').innerHTML=
+      `<polyline points="${pts}" fill="none" stroke="rgba(88,255,176,.7)" stroke-width="1"/>`;
+  }
+}
+function drawIonoGauge(hMed,hs){
+  const c=document.getElementById('io-gauge'),g=c.getContext('2d');
+  g.clearRect(0,0,c.width,c.height);
+  const y=h=>16+(110-h)/50*(c.height-34);
+  g.strokeStyle='rgba(88,255,176,.25)';g.fillStyle='#4f8a6f';
+  g.font='10px Consolas';g.textAlign='left';
+  for(let km=60;km<=110;km+=10){
+    g.beginPath();g.moveTo(52,y(km));g.lineTo(96,y(km));g.stroke();
+    g.fillText(km+' km',100,y(km)+3);
+  }
+  g.fillStyle='rgba(88,255,176,.06)';
+  g.fillRect(56,y(110),36,y(60)-y(110));
+  if(hMed==null){
+    g.fillStyle='#4f6a5c';g.textAlign='center';
+    g.fillText('?',74,(y(60)+y(110))/2);
+    g.textAlign='left';return;}
+  for(const hv of hs||[]){
+    g.fillStyle='rgba(88,255,176,.45)';
+    g.beginPath();g.arc(74,y(hv),2.5,0,7);g.fill();}
+  g.strokeStyle='#58ffb0';g.lineWidth=2;
+  g.shadowColor='#58ffb0';g.shadowBlur=10;
+  g.beginPath();g.moveTo(54,y(hMed));g.lineTo(94,y(hMed));g.stroke();
+  g.shadowBlur=0;g.lineWidth=1;
+  g.fillStyle='#58ffb0';g.font='bold 12px Consolas';g.textAlign='right';
+  g.fillText(hMed.toFixed(1),50,y(hMed)+4);
+  g.textAlign='left';
+}
+function drawIonoRings(tweeks){
+  const c=document.getElementById('io-map'),g=c.getContext('2d');
+  g.clearRect(0,0,c.width,c.height);
+  const cx=c.width/2,cy=c.height/2,maxR=Math.min(cx,cy)-10;
+  g.font='9px Consolas';g.textAlign='center';
+  for(let km=1000;km<=5000;km+=1000){
+    const r=km/5000*maxR;
+    g.strokeStyle='rgba(88,255,176,.12)';
+    g.beginPath();g.arc(cx,cy,r,0,7);g.stroke();
+    if(km%2000===1000){g.fillStyle='#3a6e57';
+      g.fillText((km/1000)+'k km',cx,cy-r-2);}
+  }
+  g.fillStyle='#58ffb0';g.shadowColor='#58ffb0';g.shadowBlur=8;
+  g.beginPath();g.arc(cx,cy,3,0,7);g.fill();g.shadowBlur=0;
+  const ds=(tweeks||[]).map(t=>t.D_km).sort((a,b)=>a-b);
+  let lastLbl=-1e9;
+  for(const D of ds){
+    const r=Math.min(1,D/5000)*maxR;
+    g.strokeStyle='rgba(88,255,176,.75)';g.lineWidth=1.5;
+    g.shadowColor='#58ffb0';g.shadowBlur=6;
+    g.beginPath();g.arc(cx,cy,r,0,7);g.stroke();
+    g.shadowBlur=0;g.lineWidth=1;
+    if(r-lastLbl>14){lastLbl=r;g.fillStyle='#bfe8d4';
+      g.fillText(Math.round(D)+' km',cx,cy+r+9);}
+  }
+  g.textAlign='left';
+}
+const VERD_COL={'QUIET':'#58ffb0','LEARNING':'#58ffb0','ELEVATED':'#ffb457',
+  'STORM-TRIGGER':'#ff6b4d'};
+function renderIono(j){
+  const st=j.state||{};
+  const sn=st.sniff||{},base=st.baseline||{},trg=st.trigger||{},
+    storm=st.storm||{};
+  let h='';
+  h+=ioChip('SFERICS',sn.rate_per_min!=null?sn.rate_per_min+'/min':'—');
+  if(sn.rate_dispersed_per_min!=null)
+    h+=ioChip('DISPERSED (SKY)',sn.rate_dispersed_per_min+'/min');
+  if(sn.powerline_frac!=null&&sn.powerline_frac>0.3)
+    h+=ioChip('POWERLINE COMB',Math.round(sn.powerline_frac*100)+'%','#ffb457');
+  if(sn.verdict)h+=ioChip('VERDICT',sn.verdict,VERD_COL[sn.verdict]||'#4f8a6f');
+  h+=ioChip('QUIET BASELINE',base.rate_per_min!=null?
+    base.rate_per_min+'/min · '+base.n_samples+' sniffs':'learning');
+  h+=ioChip('TRIGGERS AT',trg.threshold!=null?trg.threshold+'/min':'unarmed');
+  h+=ioChip('LAST SNIFF',sn.ts_utc?ioAge(sn.ts_utc):'never');
+  h+=ioChip('STORM SESSION',storm.ts_utc?
+    ioAge(storm.ts_utc)+' · '+(storm.n_tweeks_good||0)+' tweeks':'none yet');
+  if(sn.overflows)h+=ioChip('OVERFLOWS',sn.overflows,'#ffb457');
+  document.getElementById('io-strip').innerHTML=h;
+  renderDoors(j.bands);
+  // ceiling: prefer the storm session's fits, else the hourly sniff's
+  const src=(storm.n_tweeks_good?storm:(sn.h_km_median!=null?sn:null));
+  const tweeks=(src&&src.tweeks)||[];
+  drawIonoGauge(src?src.h_km_median:null,tweeks.map(t=>t.h_km));
+  document.getElementById('io-ceil-lbl').innerHTML=src?
+    `median <b style="color:#58ffb0">${src.h_km_median} km</b> from `+
+    `${src.n_tweeks_good||tweeks.length} tweek fit(s) · f&#8320; ${src.fc_khz_median||'—'} kHz`:
+    '<span class="io-grey">grey until a storm session or a tweek-bearing sniff</span>';
+  drawIonoRings(tweeks);
+  document.getElementById('io-rate').innerHTML=tweeks.length?
+    tweeks.length+' fitted tweek range(s) · nearest '+
+    Math.round(Math.min(...tweeks.map(t=>t.D_km)))+' km · farthest '+
+    Math.round(Math.max(...tweeks.map(t=>t.D_km)))+' km':
+    '<span class="io-grey">rings light up when dispersion fits land'+
+    (storm.ts_utc?'':' — no storm session yet')+'</span>';
+}
+function pollIono(){
+  if(CUR_DECK!=='iono')return;
+  fetch('/api/iono').then(r=>r.json()).then(j=>{
+    if(!j.ok){document.getElementById('io-strip').innerHTML=
+      '<span class="io-grey">iono feed unavailable'+
+      (j.err?' — '+j.err:'')+'</span>';return;}
+    renderIono(j);
+  }).catch(()=>{});
+}
+setInterval(pollIono,12000);
 if(localStorage.getItem('rt_deck'))deck(localStorage.getItem('rt_deck'));
 </script><script>
 let stations=[];
@@ -2797,6 +3055,9 @@ class H(BaseHTTPRequestHandler):
             return
         elif self.path == "/api/atlas":
             self._send(json.dumps(atlas_summary()))
+            return
+        elif self.path == "/api/iono":
+            self._send(json.dumps(iono_summary()))
             return
         elif self.path.startswith("/api/sw/sched"):
             from urllib.parse import urlparse, parse_qs
