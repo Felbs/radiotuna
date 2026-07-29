@@ -816,6 +816,214 @@ def iono_summary():
     return out
 
 
+# ─────────────────────── ATLAS HEATMAP (phase 3) ──────────────────────
+# The 24/7 picture the observatory was built for: channels down the Y
+# axis, time across X, colour = how well that channel came in — and one
+# selector that zooms the same view from a DAY out to a YEAR as the
+# seasons turn.  Read-only against lab/prop_atlas.db (immutable-style RO
+# URI, short queries) because the daemon is writing to it every 30 min.
+#
+# Day/night tinting uses a COARSE REGIONAL grid point for the mid-
+# Atlantic US — it is deliberately NOT the station's location, only
+# enough geometry to know roughly when the sun is up over the region.
+ATLAS_LAT, ATLAS_LON = 38.5, -77.5        # regional, coarse, not a QTH
+
+#         span : (window hours, bucket hours, n buckets)
+ATLAS_SPANS = {"day":   (24,        1.0,       24),
+               "week":  (7 * 24,    3.0,       56),
+               "month": (30 * 24,   24.0,      30),
+               "year":  (364 * 24,  24 * 7.0,  52)}
+ATLAS_BAND_ORDER = ["MW", "49m", "41m", "31m", "25m", "19m"]
+ATLAS_ALIVE_Q = 18                        # prop_atlas.py's listenable line
+
+
+def _sun_elev_deg(dt):
+    """Low-precision solar elevation (deg) over the regional grid point.
+    Good to ~0.5 deg — plenty to shade a heatmap day from night."""
+    import math
+    from datetime import datetime as _dt, timezone as _tz
+    n = (dt - _dt(2000, 1, 1, 12, tzinfo=_tz.utc)).total_seconds() / 86400.0
+    L = math.radians((280.460 + 0.9856474 * n) % 360)
+    g = math.radians((357.528 + 0.9856003 * n) % 360)
+    lam = (L + math.radians(1.915) * math.sin(g)
+           + math.radians(0.020) * math.sin(2 * g))
+    eps = math.radians(23.439 - 4e-7 * n)
+    ra = math.atan2(math.cos(eps) * math.sin(lam), math.cos(lam))
+    dec = math.asin(math.sin(eps) * math.sin(lam))
+    gmst = (18.697374558 + 24.06570982441908 * n) % 24.0
+    ha = math.radians(
+        (gmst * 15.0 + ATLAS_LON - math.degrees(ra) + 180) % 360 - 180)
+    la = math.radians(ATLAS_LAT)
+    return round(math.degrees(math.asin(
+        math.sin(la) * math.sin(dec)
+        + math.cos(la) * math.cos(dec) * math.cos(ha))), 1)
+
+
+def _tz_short():
+    """'Eastern Daylight Time' -> 'EDT'.  Windows hands back the long
+    name and it will not fit the heatmap's axis gutter."""
+    try:
+        name = datetime.now().astimezone().strftime("%Z")
+        return ("".join(w[0] for w in name.split())
+                if " " in name else name) or "LOCAL"
+    except Exception:
+        return "LOCAL"
+
+
+def atlas_heat(span="day", band=None, max_rows=44):
+    """channel x time matrix for the ATLAS deck's heatmap.
+
+    Rows = channels that were ever ALIVE in the window (fair share per
+    band so MW's loud locals can't crowd out the shortwave story),
+    columns = time buckets, cells = mean q with a per-cell sample count
+    so the UI can dim sparse buckets.  Everything aggregates in SQL;
+    the response stays tens of kB.  Any trouble at all -> {"ok": False}
+    and a friendly message: the panel must never fall over."""
+    out = {"ok": False, "span": span}
+    try:
+        if span not in ATLAS_SPANS:
+            span = "day"
+        hours, bucket_h, ncols = ATLAS_SPANS[span]
+        db = LAB / "prop_atlas.db"
+        if not db.exists():
+            out["err"] = "no atlas db yet — start the observatory"
+            return out
+        import sqlite3
+        from datetime import datetime as _dt, timedelta as _td
+        from datetime import timezone as _tz
+        max_rows = max(8, min(120, int(max_rows or 44)))
+        now = _dt.now(_tz.utc)
+        step = _td(hours=bucket_h)
+        if bucket_h < 24:                     # align to natural boundaries
+            anchor = now.replace(minute=0, second=0, microsecond=0)
+            anchor -= _td(hours=anchor.hour % int(bucket_h))
+        else:
+            anchor = now.replace(hour=0, minute=0, second=0, microsecond=0)
+        t_end = anchor + step                 # last column = right now
+        t0 = t_end - ncols * step
+        s0 = t0.strftime("%Y-%m-%dT%H:%M:%SZ")
+
+        cx = sqlite3.connect(f"file:{db.as_posix()}?mode=ro", uri=True,
+                             timeout=2.0)
+        try:
+            where, args = "ts_utc >= ?", [s0]
+            if band and band != "ALL":
+                where += " AND band = ?"
+                args.append(band)
+            rank = cx.execute(
+                "SELECT khz, band, COUNT(*), "
+                "SUM(CASE WHEN q >= ? THEN 1 ELSE 0 END), "
+                "AVG(q), MAX(q), AVG(pwr_db), MAX(expected) "
+                f"FROM scans WHERE {where} GROUP BY khz, band",
+                [ATLAS_ALIVE_Q] + args).fetchall()
+            n_sweeps, first_ts, last_ts = cx.execute(
+                "SELECT COUNT(DISTINCT ts_utc), MIN(ts_utc), MAX(ts_utc) "
+                f"FROM sweeps WHERE {where}", args).fetchone()
+            all_bands = [b for (b,) in
+                         cx.execute("SELECT DISTINCT band FROM sweeps")]
+
+            pool = [r for r in rank if (r[3] or 0) > 0] or rank
+            pool.sort(key=lambda r: (-(r[3] or 0), -(r[4] or 0),
+                                     -(r[6] if r[6] is not None else -999)))
+            per = {}
+            for r in pool:
+                per.setdefault(r[1], []).append(r)
+            quota = max(1, max_rows // max(1, len(per)))
+            keep, spill = [], []
+            for b in (ATLAS_BAND_ORDER
+                      + [b for b in per if b not in ATLAS_BAND_ORDER]):
+                got = per.get(b)
+                if not got:
+                    continue
+                keep.extend(got[:quota])
+                spill.extend(got[quota:])
+            spill.sort(key=lambda r: (-(r[3] or 0), -(r[4] or 0)))
+            keep.extend(spill[:max(0, max_rows - len(keep))])
+            dropped = max(0, len(pool) - len(keep))
+            bpos = {b: i for i, b in enumerate(ATLAS_BAND_ORDER)}
+            keep.sort(key=lambda r: (bpos.get(r[1], 99), r[0]))
+            khzs = [r[0] for r in keep]
+
+            grid_q = [[None] * ncols for _ in khzs]
+            grid_n = [[0] * ncols for _ in khzs]
+            grid_p = [[None] * ncols for _ in khzs]
+            if khzs:
+                j0 = cx.execute("SELECT julianday(?)", (s0,)).fetchone()[0]
+                marks = ",".join("?" * len(khzs))
+                cells = cx.execute(
+                    "SELECT khz, CAST((julianday(ts_utc) - ?) * 24.0 / ? "
+                    "AS INTEGER) AS b, AVG(q), COUNT(*), AVG(pwr_db) "
+                    f"FROM scans WHERE {where} AND khz IN ({marks}) "
+                    "GROUP BY khz, b",
+                    [j0, bucket_h] + args + khzs).fetchall()
+                ri = {k: i for i, k in enumerate(khzs)}
+                for khz, b, aq, nn, ap in cells:
+                    i = ri.get(khz)
+                    if i is None or b is None or b < 0 or b >= ncols:
+                        continue
+                    grid_q[i][b] = round(aq, 1) if aq is not None else None
+                    grid_n[i][b] = nn
+                    grid_p[i][b] = round(ap, 1) if ap is not None else None
+        finally:
+            cx.close()
+
+        cols = []
+        for c in range(ncols):
+            t = t0 + c * step
+            loc = t.astimezone()
+            if bucket_h < 24:
+                lab, maj = "%02d" % t.hour, (t.hour % 6 == 0)
+            elif bucket_h == 24:
+                lab = t.strftime("%d")
+                maj = (t.day == 1 or t.weekday() == 0)
+            else:
+                lab, maj = t.strftime("%b%d"), True
+            cols.append({"t": t.strftime("%Y-%m-%dT%H:%MZ"), "lab": lab,
+                         "maj": maj, "hu": t.hour, "hl": loc.hour,
+                         "sun": _sun_elev_deg(t + step / 2)})
+
+        rows = [{"khz": r[0], "band": r[1], "n": r[2], "alive": r[3],
+                 "avg_q": round(r[4], 1) if r[4] is not None else None,
+                 "max_q": r[5],
+                 "avg_db": round(r[6], 1) if r[6] is not None else None,
+                 "sked": r[7]} for r in keep]
+        groups, run = [], None
+        for i, r in enumerate(rows):
+            if run is None or run["band"] != r["band"]:
+                run = {"band": r["band"], "i0": i, "i1": i}
+                groups.append(run)
+            run["i1"] = i
+
+        covered = 0.0
+        if first_ts and last_ts:
+            try:
+                covered = round((
+                    _dt.strptime(last_ts, "%Y-%m-%dT%H:%M:%SZ")
+                    - _dt.strptime(first_ts, "%Y-%m-%dT%H:%M:%SZ")
+                ).total_seconds() / 3600.0, 1)
+            except ValueError:
+                covered = 0.0
+
+        out.update(ok=True, span=span, band=(band or "ALL"),
+                   bucket_h=bucket_h, ncols=ncols, t0=s0,
+                   t1=t_end.strftime("%Y-%m-%dT%H:%M:%SZ"),
+                   cols=cols, rows=rows, groups=groups,
+                   q=grid_q, n=grid_n, p=grid_p,
+                   dropped=dropped, alive_q=ATLAS_ALIVE_Q,
+                   n_sweeps=n_sweeps or 0, first_ts=first_ts,
+                   last_ts=last_ts, hours_covered=covered,
+                   window_hours=hours,
+                   bands=[b for b in ATLAS_BAND_ORDER if b in all_bands]
+                         + [b for b in all_bands
+                            if b not in ATLAS_BAND_ORDER],
+                   tz=_tz_short(),
+                   geo="regional grid point (coarse) — not a location")
+    except Exception as e:
+        out["ok"] = False
+        out["err"] = str(e)
+    return out
+
+
 def _scan_begin(eta_s):
     """Take the radio for a scan: refuse if a scan is already running,
     yield any live listener (single-tenant SDR), start the progress
@@ -1983,6 +2191,46 @@ border-bottom:2px solid rgba(88,255,176,.5);transition:height 1.2s}
 #io-ceil-lbl{text-align:center;font-size:12px;color:#bfe8d4;margin-top:6px}
 #io-rate{font-size:12px;color:#bfe8d4;margin-top:6px}
 .io-grey{color:#4f6a5c;font-style:italic}
+/* ── ATLAS deck — the propagation heatmap (phase 3, 2026-07-29) ── */
+.decktab.atlas.on{color:#c79bff;border-color:rgba(199,155,255,.6);
+text-shadow:0 0 10px rgba(199,155,255,.7)}
+#cab-atlas{max-width:1180px;margin:0 auto;padding:20px;border-radius:8px;
+background:radial-gradient(ellipse at 50% -10%,rgba(58,28,96,.5),rgba(7,4,14,.96) 65%),#0a0614;
+border:1px solid rgba(199,155,255,.35);
+box-shadow:0 0 26px rgba(199,155,255,.10),inset 0 0 70px rgba(0,0,0,.6);
+color:#d5c6ee;font-family:Consolas,monospace}
+#cab-atlas h2{margin:0;color:#c79bff;letter-spacing:4px;font-size:20px;
+text-shadow:0 0 14px rgba(199,155,255,.8),0 0 44px rgba(120,60,200,.3)}
+#cab-atlas .sub{color:#7d6a9c}
+#at-ctl{margin:12px 0 8px;display:flex;gap:16px;flex-wrap:wrap;
+align-items:center}
+#at-ctl .grp{display:flex;gap:4px;align-items:center}
+#at-ctl .lbl{font-size:10px;color:#7d6a9c;letter-spacing:2px;
+margin-right:4px}
+.atbtn{cursor:pointer;padding:4px 12px;border:1px solid rgba(199,155,255,.3);
+border-radius:2px;color:#b3a2cc;background:#120c1e;font-size:12px;
+letter-spacing:2px;font-family:inherit;user-select:none}
+.atbtn:hover{background:#1c1330;border-color:rgba(199,155,255,.6)}
+.atbtn.on{color:#f0e6ff;background:#2a1a45;border-color:rgba(199,155,255,.8);
+box-shadow:0 0 10px rgba(199,155,255,.25)}
+#at-stat{font-size:11px;color:#7d6a9c;margin-left:auto;text-align:right}
+#at-wrap{border:1px solid rgba(199,155,255,.22);border-radius:6px;
+background:rgba(8,4,16,.75);padding:8px;overflow-x:auto}
+#at-heat{display:block;cursor:crosshair;max-width:100%}
+#at-read{min-height:34px;margin-top:8px;padding:6px 10px;font-size:12px;
+border:1px solid rgba(199,155,255,.2);border-radius:4px;
+background:rgba(199,155,255,.04);color:#d5c6ee}
+#at-read b{color:#c79bff}
+#at-legend{display:flex;gap:14px;align-items:center;flex-wrap:wrap;
+margin-top:10px;font-size:11px;color:#7d6a9c}
+#at-ramp{width:190px;height:11px;border-radius:2px;
+border:1px solid rgba(199,155,255,.25);
+background:linear-gradient(90deg,#0e0a1c,#2a1b4d 17%,#5b2f8a 33%,
+#a13f8f 55%,#e0713f 78%,#ffe9a8)}
+.at-sw{display:inline-block;width:11px;height:11px;border-radius:2px;
+vertical-align:-1px;margin-right:4px;border:1px solid rgba(199,155,255,.2)}
+.at-grey{color:#5d5077;font-style:italic}
+#at-note{margin-top:8px;font-size:11px;color:#8f7ab0}
 </style></head><body>
 <div id="masthead">
   <div class="brand">RADIO <b>TUNA</b></div>
@@ -1991,6 +2239,7 @@ border-bottom:2px solid rgba(88,255,176,.5);transition:height 1.2s}
     <div class="decktab am" data-deck="am" onclick="deck('am')">AM · NIGHTWAVE</div>
     <div class="decktab sw" data-deck="sw" onclick="deck('sw')">SW · WORLDBAND</div>
     <div class="decktab iono" data-deck="iono" onclick="deck('iono')">IONO · SKYWATCH</div>
+    <div class="decktab atlas" data-deck="atlas" onclick="deck('atlas')">ATLAS · HEATMAP</div>
   </div>
 </div>
 <div id="deck-fm" class="deck on"><div id="cabinet">
@@ -2176,6 +2425,36 @@ rgba(0,229,255,.35);border-radius:6px;margin:10px 0;padding:8px">
   </div>
 </div></div>
 
+<div id="deck-atlas" class="deck"><div id="cab-atlas">
+  <h2>PROPAGATION ATLAS</h2>
+  <div class="sub">every channel the observatory hears, all day long &mdash; and
+    the same picture zoomed out to a week, a month, a year as the weather and
+    the seasons turn the bands over</div>
+  <div id="at-ctl">
+    <div class="grp"><span class="lbl">SPAN</span>
+      <span class="atbtn on" data-span="day"   onclick="atSpan('day')">DAY</span>
+      <span class="atbtn"     data-span="week" onclick="atSpan('week')">WEEK</span>
+      <span class="atbtn"     data-span="month" onclick="atSpan('month')">MONTH</span>
+      <span class="atbtn"     data-span="year" onclick="atSpan('year')">YEAR</span>
+    </div>
+    <div class="grp" id="at-bands"><span class="lbl">BAND</span>
+      <span class="atbtn on" data-band="ALL" onclick="atBand('ALL')">ALL</span>
+    </div>
+    <div id="at-stat"><span class="at-grey">reading the atlas&hellip;</span></div>
+  </div>
+  <div id="at-wrap"><canvas id="at-heat" width="1120" height="520"></canvas></div>
+  <div id="at-read"><span class="at-grey">hover (or tap) a cell for the
+    channel, the hour and the measured quality</span></div>
+  <div id="at-legend">
+    <span>QUALITY</span><span>0</span><span id="at-ramp"></span><span>90</span>
+    <span><span class="at-sw" style="background:#191720"></span>no sweep</span>
+    <span><span class="at-sw" style="background:linear-gradient(90deg,#0b1030,#e0a14a)"></span>
+      night &rarr; day (regional sun, coarse)</span>
+    <span>faded cell = fewer samples in that bucket</span>
+  </div>
+  <div id="at-note"></div>
+</div></div>
+
 <script>
 /* ── RADIO TUNA deck switching + AM/SW logic ── */
 let CUR_DECK='fm', SW_BAND='31m';
@@ -2185,7 +2464,8 @@ function deck(d){CUR_DECK=d;
   document.querySelectorAll('.decktab').forEach(e=>
     e.classList.toggle('on', e.dataset.deck===d));
   localStorage.setItem('rt_deck', d);
-  if(d==='iono'&&typeof pollIono==='function')pollIono();}
+  if(d==='iono'&&typeof pollIono==='function')pollIono();
+  if(d==='atlas'&&typeof atFetch==='function')atFetch();}
 function post(u,b){return fetch(u,{method:'POST',
   headers:{'Content-Type':'application/json'},body:JSON.stringify(b||{})});}
 function _scanPost(url,body,el,msg){
@@ -2626,6 +2906,225 @@ function pollIono(){
   }).catch(()=>{});
 }
 setInterval(pollIono,12000);
+/* ── ATLAS deck — the propagation heatmap (observatory phase 3) ────────
+   /api/atlas/heat is a read-only SQL aggregate over lab/prop_atlas.db.
+   Fetched on deck open and on span/band change only, plus a lazy 5-min
+   creep while the deck is showing — the daemon owns that file. */
+const AT_HINT='<span class="at-grey">hover (or tap) a cell for the channel, '+
+  'the hour and the measured quality</span>';
+const AT_G={gut:76,top:30,bot:36,pad:10};
+let AT={j:null,span:'day',band:'ALL',busy:false,G:null,bandsDrawn:''};
+const AT_STOPS=[[0,14,10,28],[0.17,42,27,77],[0.33,91,47,138],
+                [0.55,161,63,143],[0.78,224,113,63],[1,255,233,168]];
+function atCol(v){
+  v=Math.max(0,Math.min(1,v));
+  for(let i=1;i<AT_STOPS.length;i++){
+    const a=AT_STOPS[i-1],b=AT_STOPS[i];
+    if(v<=b[0]){const u=(v-a[0])/Math.max(1e-6,b[0]-a[0]);
+      return [Math.round(a[1]+u*(b[1]-a[1])),
+              Math.round(a[2]+u*(b[2]-a[2])),
+              Math.round(a[3]+u*(b[3]-a[3]))];}}
+  return [255,233,168];
+}
+function atSunCol(e){
+  const u=Math.max(0,Math.min(1,(e+12)/30));
+  return 'rgb('+Math.round(11+u*213)+','+Math.round(16+u*145)+','+
+    Math.round(48+u*26)+')';
+}
+function atGrade(q){
+  return q>=75?'EXCELLENT':q>=55?'GOOD':q>=35?'FAIR':q>=18?'ROUGH':'STATIC';
+}
+function atGeom(j){
+  const nr=j.rows.length,nc=Math.max(1,j.ncols);
+  const ch=Math.max(7,Math.min(16,Math.floor(470/Math.max(1,nr))));
+  const wrap=document.getElementById('at-wrap');
+  const availW=Math.max(600,(wrap&&wrap.clientWidth?wrap.clientWidth:1140)-22);
+  const cw=Math.max(6,Math.floor((availW-AT_G.gut-AT_G.pad)/nc));
+  return {ch:ch,cw:cw,nr:nr,nc:nc,W:AT_G.gut+cw*nc+AT_G.pad,
+          H:AT_G.top+ch*Math.max(1,nr)+AT_G.bot};
+}
+function atDraw(hr,hc){
+  const j=AT.j;if(!j)return;
+  const c=document.getElementById('at-heat'),g=c.getContext('2d');
+  const G=atGeom(j);AT.G=G;
+  c.width=G.W;c.height=G.H;
+  g.fillStyle='#080512';g.fillRect(0,0,c.width,c.height);
+  const x0=AT_G.gut,y0=AT_G.top,plotH=G.ch*G.nr;
+  if(!G.nr){
+    g.fillStyle='#5d5077';g.font='13px Consolas';
+    g.fillText('no channels heard in this window yet — the atlas sweeps '+
+      'every 30 min',x0,y0+30);return;}
+  let ns=[];
+  for(const row of j.n)for(const v of row)if(v>0)ns.push(v);
+  ns.sort((a,b)=>a-b);
+  const nRef=ns.length?ns[Math.floor(ns.length*0.6)]:1;
+  for(let ci=0;ci<G.nc;ci++){            /* sun strip: night → day */
+    g.fillStyle=atSunCol(j.cols[ci].sun);
+    g.fillRect(x0+ci*G.cw,y0-14,G.cw,9);}
+  for(let ri=0;ri<G.nr;ri++)for(let ci=0;ci<G.nc;ci++){
+    const q=j.q[ri][ci],n=j.n[ri][ci];
+    const x=x0+ci*G.cw,y=y0+ri*G.ch;
+    if(q===null||q===undefined||!n){
+      g.fillStyle='#191720';g.fillRect(x,y,G.cw-0.5,G.ch-0.5);continue;}
+    const rgb=atCol(q/90),a=0.42+0.58*Math.min(1,n/nRef);
+    g.fillStyle='rgba('+rgb[0]+','+rgb[1]+','+rgb[2]+','+a.toFixed(2)+')';
+    g.fillRect(x,y,G.cw-0.5,G.ch-0.5);}
+  for(let ci=1;ci<G.nc;ci++){            /* terminator crossings */
+    const a=j.cols[ci-1].sun,b=j.cols[ci].sun;
+    if((a<0)!==(b<0)){
+      const x=x0+ci*G.cw;g.save();g.setLineDash([3,3]);
+      g.strokeStyle=b>=0?'rgba(255,200,110,.40)':'rgba(120,150,255,.34)';
+      g.beginPath();g.moveTo(x,y0);g.lineTo(x,y0+plotH);g.stroke();
+      g.restore();}}
+  for(const grp of j.groups||[]){        /* band bands */
+    const y=y0+grp.i0*G.ch;
+    if(grp.i0>0){g.strokeStyle='rgba(199,155,255,.30)';
+      g.beginPath();g.moveTo(2,y-0.5);g.lineTo(x0+G.cw*G.nc,y-0.5);
+      g.stroke();}
+    g.fillStyle='#c79bff';g.font='bold 10px Consolas';g.textAlign='left';
+    g.fillText(grp.band,2,y+G.ch-1.5);}
+  g.font='9px Consolas';g.textAlign='right';
+  const stride=G.ch>=10?1:(G.ch>=8?2:3);
+  for(let ri=0;ri<G.nr;ri++){
+    if(ri%stride&&ri!==hr)continue;
+    g.fillStyle=(ri===hr)?'#f0e6ff':'#8f7ab0';
+    g.fillText(j.rows[ri].khz.toFixed(0),x0-5,y0+ri*G.ch+G.ch-1.5);}
+  g.font='9px Consolas';
+  g.fillStyle='#7d6a9c';g.textAlign='right';
+  g.fillText('UTC',x0-5,y0+plotH+11);
+  g.textAlign='center';
+  for(let ci=0;ci<G.nc;ci++){
+    const cd=j.cols[ci];
+    if(!cd.maj&&G.cw<20)continue;
+    g.fillStyle=(ci===hc)?'#f0e6ff':(cd.maj?'#c0abe0':'#7d6a9c');
+    g.fillText(cd.lab,x0+ci*G.cw+G.cw/2,y0+plotH+11);}
+  if(j.bucket_h<24){
+    g.textAlign='right';g.fillStyle='#5d5077';
+    g.fillText(j.tz||'LOCAL',x0-5,y0+plotH+22);
+    g.textAlign='center';g.fillStyle='#5d5077';
+    for(let ci=0;ci<G.nc;ci++){
+      const cd=j.cols[ci];
+      if(!cd.maj&&G.cw<20)continue;
+      g.fillText(('0'+cd.hl).slice(-2),x0+ci*G.cw+G.cw/2,y0+plotH+22);}}
+  if(hr>=0&&hc>=0){
+    g.strokeStyle='rgba(240,230,255,.8)';g.lineWidth=1;
+    g.strokeRect(x0+hc*G.cw-0.5,y0+hr*G.ch-0.5,G.cw,G.ch);}
+  g.textAlign='left';
+}
+function atPick(ev){
+  const j=AT.j,G=AT.G;if(!j||!G||!G.nr)return;
+  const c=document.getElementById('at-heat'),b=c.getBoundingClientRect();
+  const pt=(ev.touches&&ev.touches[0])?ev.touches[0]:ev;
+  const sx=c.width/Math.max(1,b.width),sy=c.height/Math.max(1,b.height);
+  const x=(pt.clientX-b.left)*sx,y=(pt.clientY-b.top)*sy;
+  const ci=Math.floor((x-AT_G.gut)/G.cw),ri=Math.floor((y-AT_G.top)/G.ch);
+  const el=document.getElementById('at-read');
+  if(ci<0||ci>=G.nc||ri<0||ri>=G.nr){atDraw(-1,-1);el.innerHTML=AT_HINT;return;}
+  atDraw(ri,ci);
+  const r=j.rows[ri],cd=j.cols[ci];
+  const q=j.q[ri][ci],n=j.n[ri][ci],p=j.p[ri][ci];
+  let s='<b>'+r.khz.toFixed(0)+' kHz</b> · '+r.band+
+    (r.sked?' · <i>'+r.sked+'</i>':'')+' &nbsp;|&nbsp; '+cd.t+
+    (j.bucket_h<24?' ('+('0'+cd.hl).slice(-2)+':00 '+(j.tz||'local')+')':'')+
+    ' &nbsp;|&nbsp; sun '+cd.sun.toFixed(0)+'&deg; ';
+  if(q===null||q===undefined||!n){
+    s+='&nbsp;|&nbsp; <span class="at-grey">no sweep landed in this '+
+       'bucket</span>';}
+  else{
+    s+='&nbsp;|&nbsp; <b>Q '+q.toFixed(1)+'</b> '+atGrade(q)+
+       (q>=j.alive_q?'':' (below the alive line)')+
+       ' · '+n+' sample'+(n===1?'':'s')+
+       (p!==null&&p!==undefined?' · '+p.toFixed(1)+' dB':'');}
+  s+='<br><span class="at-grey">window: '+r.alive+'/'+r.n+
+     ' sweeps alive · mean Q '+(r.avg_q===null?'—':r.avg_q)+
+     ' · best Q '+(r.max_q===null?'—':r.max_q)+'</span>';
+  el.innerHTML=s;
+}
+function atSpan(s){
+  AT.span=s;
+  document.querySelectorAll('#at-ctl [data-span]').forEach(e=>
+    e.classList.toggle('on',e.dataset.span===s));
+  atFetch();
+}
+function atBand(b){
+  AT.band=b;
+  document.querySelectorAll('#at-bands [data-band]').forEach(e=>
+    e.classList.toggle('on',e.dataset.band===b));
+  atFetch();
+}
+function atBandBtns(bands){
+  const key=(bands||[]).join(',');
+  if(key===AT.bandsDrawn)return;
+  AT.bandsDrawn=key;
+  const box=document.getElementById('at-bands');
+  box.innerHTML='<span class="lbl">BAND</span>';
+  ['ALL'].concat(bands||[]).forEach(function(b){
+    const s=document.createElement('span');  /* built through the DOM, not
+      string concat: no quote-escaping through the Python page string */
+    s.className='atbtn'+(b===AT.band?' on':'');
+    s.dataset.band=b;s.textContent=b;
+    s.addEventListener('click',function(){atBand(b);});
+    box.appendChild(s);});
+}
+const AT_SPANLBL={day:'24 hours',week:'7 days',month:'30 days',
+                  year:'52 weeks'};
+function atStat(j){
+  document.getElementById('at-stat').innerHTML=
+    '<b style="color:#c79bff">'+j.rows.length+'</b> channels &times; '+
+    j.ncols+' buckets · '+j.n_sweeps+' sweeps in window'+
+    (j.dropped?' · '+j.dropped+' quieter channels not shown':'')+
+    '<br><span class="at-grey">'+AT_SPANLBL[j.span]+' to '+
+    (j.last_ts||'—')+'</span>';
+  const cov=j.hours_covered||0,need=j.window_hours||24;
+  let note='';
+  if(!j.n_sweeps){
+    note='no sweeps in this window yet — the observatory writes every '+
+      '30 minutes, so the DAY view is the first one to fill.';}
+  else if(cov+0.5<need){
+    const nt=need<48?Math.round(need)+' hours':
+             (Math.round(need/24*10)/10)+' days';
+    note='only <b>'+cov.toFixed(1)+' h</b> of atlas so far, and this view '+
+      'spans '+nt+' — the '+
+      (j.span==='day'?'left edge stays blank':'WEEK, MONTH and YEAR views '+
+       'fill in')+' as the atlas grows. Nothing here is interpolated: a '+
+      'grey cell means no sweep landed in that bucket.';}
+  else{
+    note='full window covered · dark = dead channel, bright = a station '+
+      'walking in · dashed lines are regional sunrise/sunset.';}
+  document.getElementById('at-note').innerHTML=note;
+}
+function atFetch(){
+  if(AT.busy)return;
+  AT.busy=true;
+  fetch('/api/atlas/heat?span='+encodeURIComponent(AT.span)+
+        '&band='+encodeURIComponent(AT.band))
+   .then(r=>r.json()).then(j=>{
+     AT.busy=false;
+     if(!j||!j.ok){
+       document.getElementById('at-stat').innerHTML=
+         '<span class="at-grey">atlas unavailable'+
+         (j&&j.err?' — '+j.err:'')+'</span>';
+       document.getElementById('at-note').innerHTML=
+         'the heatmap reads lab/prop_atlas.db — start the observatory '+
+         '(tools/atlas_start.ps1) and it will fill in from the next sweep.';
+       return;}
+     AT.j=j;atBandBtns(j.bands);atStat(j);atDraw(-1,-1);
+     document.getElementById('at-read').innerHTML=AT_HINT;})
+   .catch(()=>{AT.busy=false;});
+}
+(function(){
+  const c=document.getElementById('at-heat');
+  if(!c)return;
+  c.addEventListener('mousemove',atPick);
+  c.addEventListener('mouseleave',()=>{atDraw(-1,-1);
+    document.getElementById('at-read').innerHTML=AT_HINT;});
+  c.addEventListener('touchstart',e=>{atPick(e);e.preventDefault();},
+                     {passive:false});
+  c.addEventListener('touchmove',e=>{atPick(e);e.preventDefault();},
+                     {passive:false});
+})();
+window.addEventListener('resize',()=>{if(CUR_DECK==='atlas')atDraw(-1,-1);});
+setInterval(function(){if(CUR_DECK==='atlas')atFetch();},300000);
 if(localStorage.getItem('rt_deck'))deck(localStorage.getItem('rt_deck'));
 </script><script>
 let stations=[];
@@ -3055,6 +3554,19 @@ class H(BaseHTTPRequestHandler):
             return
         elif self.path == "/api/atlas":
             self._send(json.dumps(atlas_summary()))
+            return
+        elif self.path.startswith("/api/atlas/heat"):
+            # /api/atlas/heat?span=day|week|month|year&band=31m&rows=44
+            try:
+                from urllib.parse import urlparse, parse_qs
+                q = parse_qs(urlparse(self.path).query)
+                sp = (q.get("span", ["day"])[0] or "day").lower()
+                bd = q.get("band", [None])[0] or None
+                rw = int(q.get("rows", ["44"])[0])
+                body = atlas_heat(sp, bd, rw)
+            except Exception as e:                # even a bad query string
+                body = {"ok": False, "err": str(e)}   # never 500s the panel
+            self._send(json.dumps(body))
             return
         elif self.path == "/api/iono":
             self._send(json.dumps(iono_summary()))
