@@ -1,0 +1,1103 @@
+DRM audio patch for Dream 2.2 (dream_2.2.orig.tar.gz, SourceForge project drm).
+Apply with:  patch -p1 -d <dream-2.2 source root> < dream22_drm_audio.patch
+Produced 2026-07-29 for the radiotuna DRM campaign (task #34).
+
+These are modifications to Dream, which is GPL-2.0-or-later, copyright
+Volker Fischer, Alexander Kurpiers, Julian Cable, David Flamand et al.,
+TU Darmstadt / BBC / Fraunhofer IIS.  This patch is therefore also
+GPL-2.0-or-later.  Original source: https://sourceforge.net/projects/drm
+
+What it changes, and why (full write-up in drm_day_log.md):
+  * sourcedecoders/AudioCodec.cpp    - try faad2 before fdk-aac for legacy
+      DRM AAC.  Mainline fdk-aac parses the DRM SDC config but cannot decode
+      DRM30 ER-AAC-SCAL, so it claimed the service and then failed every
+      frame.  fdk-aac stays as the AAC fallback and the only xHE-AAC decoder.
+  * sourcedecoders/aac_codec.cpp     - AacCodec::Decode() never returned a
+      value, so every successfully decoded faad2 frame was discarded.
+      Also bound the sample copy to the caller-s buffer.
+  * MSC/xheaacsuperframe.cpp         - frameBorderCount==0 indexed an empty
+      vector (segfault on xHE services); the frame border index is already
+      relative to the payload section so the extra -2 corrupted every frame
+      (A/B: 673 parse errors with it, 0 without); mono/stereo test compared
+      against the enum constant instead of the value.  Follows the -14-line
+      fix for xHE-AAC decoding- thread on the Dream forum.
+  * sourcedecoders/AudioSourceDecoder.cpp - bigger resampler buffer and a
+      divide-by-zero guard for xHE-AAC.
+  * sourcedecoders/fdk_aac_codec.cpp - offer fdk a real output buffer on the
+      first frame (frameSize/numChannels are only valid after the first
+      decode); re-read stream info afterwards; extra config diagnostics.
+  * SDC/SDCReceive.cpp               - print the SDC station label, which the
+      console build otherwise has no way to show.
+  * sound/drm_portaudio.h            - CPaCommon::Enumerate called with 2 of
+      its 3 arguments; Dream 2.2 does not compile against portaudio without
+      this.
+
+NOTE: fdk-aac must be built from upstream source.  Ubuntu-s packaged
+libfdk-aac2 2.0.2-3 segfaults inside aacDecoder_ConfigRaw() on DRM xHE-AAC
+configs.  fdk-aac is under the Fraunhofer FDK AAC licence and grants NO
+patent licence.
+
+diff -ruN pristine/src/MSC/xheaacsuperframe.cpp dreambuild/src/MSC/xheaacsuperframe.cpp
+--- pristine/src/MSC/xheaacsuperframe.cpp	2026-07-29 09:44:28.685227936 -0400
++++ dreambuild/src/MSC/xheaacsuperframe.cpp	2026-07-29 09:44:10.386674705 -0400
+@@ -8,7 +8,7 @@
+ void
+ XHEAACSuperFrame::init(const CAudioParam& audioParam, unsigned frameSize)
+ {
+-    numChannels = audioParam.AM_MONO?1:2;
++    numChannels = (audioParam.eAudioMode==CAudioParam::AM_MONO)?1:2;
+     superFrameSize = frameSize;
+     payload.resize(0);
+     borders.resize(0);
+@@ -109,15 +109,17 @@
+             break;
+         default: // boundary in this superframe
+             borders[0] += start;
+-            if(borders[0]<2) return false;
+-            borders[0] -= 2; // header not in payload
++            /* xHE fix: the frame border index already refers to the payload
++               section, the 2 header bytes were never pushed into payload. */
++            //if(borders[0]<2) return false;
++            //borders[0] -= 2; // header not in payload
+             frameSize[0] = borders[0];
+             //cerr << "border 0 is " << borders[0] << " bytes from start of payload" << endl;
+             break;
+         }
+         for(unsigned i=1; i<borders.size(); i++) {
+             borders[i] += start;
+-            borders[i] -= 2; // header not in payload
++            //borders[i] -= 2; // header not in payload
+             unsigned bytes = borders[i]-borders[i-1];
+             frameSize[i] = bytes;
+             //cerr << "border " << i << " is " << borders[i] << " bytes from start of payload" << endl;
+@@ -129,6 +131,13 @@
+     // now copy into the audioFrames for simplicty
+     size_t i=0;
+     audioFrame.resize(frameBorderCount);
++    /* xHE fix: no frame border in this super frame - nothing to hand to the
++       decoder yet, the payload stays buffered for the next super frame.
++       Without this the loop below dereferences audioFrame[0] on an empty
++       vector and the receiver segfaults. */
++    if(frameBorderCount == 0) {
++        return ok;
++    }
+     audioFrame[i].resize(0);
+     while(true) {
+         audioFrame[i].push_back(payload.front());
+diff -ruN pristine/src/SDC/SDCReceive.cpp dreambuild/src/SDC/SDCReceive.cpp
+--- pristine/src/SDC/SDCReceive.cpp	2026-07-29 09:44:28.704009779 -0400
++++ dreambuild/src/SDC/SDCReceive.cpp	2026-07-29 09:32:06.088935010 -0400
+@@ -323,6 +323,17 @@
+ 
+         /* store label string in the current service structure */
+         Parameter.Lock();
++        /* radiotuna 2026-07-29: the Dream console build has no UI, and the
++           RSCI/MDI output does not carry it either, so the SDC station label
++           (data entity type 1) was unreachable without the Qt GUI.  Print it
++           once, when it changes. */
++        if (Parameter.Service[iTempShortID].strLabel != strLabel)
++        {
++            cerr << "SDC label: short id " << iTempShortID
++                 << " service id 0x" << hex
++                 << Parameter.Service[iTempShortID].iServiceID << dec
++                 << " label \"" << strLabel << "\"" << endl;
++        }
+         Parameter.Service[iTempShortID].strLabel = strLabel;
+         /* and keep it in the persistent service information store.
+          * But only if the FAC has already seen the sid. */
+diff -ruN pristine/src/sound/drm_portaudio.h dreambuild/src/sound/drm_portaudio.h
+--- pristine/src/sound/drm_portaudio.h	2026-07-29 09:44:30.411423254 -0400
++++ dreambuild/src/sound/drm_portaudio.h	2026-07-29 09:05:53.184090374 -0400
+@@ -74,7 +74,7 @@
+     virtual 		~CPaIn();
+     virtual void Enumerate(std::vector<std::string>& names, std::vector<std::string>& descriptions, std::string& defaultDevice)
+     {
+-        hw.Enumerate(names, descriptions);
++        hw.Enumerate(names, descriptions, defaultDevice);
+     }
+     virtual void	SetDev(std::string sNewDevice)
+     {
+@@ -105,7 +105,7 @@
+     virtual 			~CPaOut();
+     virtual void	Enumerate(std::vector<std::string>& names, std::vector<std::string>& descriptions, std::string& defaultOutput)
+     {
+-        hw.Enumerate(names, descriptions);
++        hw.Enumerate(names, descriptions, defaultOutput);
+     }
+     virtual void	SetDev(std::string sNewDevice)
+     {
+diff -ruN pristine/src/sourcedecoders/AudioCodec.cpp dreambuild/src/sourcedecoders/AudioCodec.cpp
+--- pristine/src/sourcedecoders/AudioCodec.cpp	2026-07-29 09:44:27.119997043 -0400
++++ dreambuild/src/sourcedecoders/AudioCodec.cpp	2026-07-29 09:20:11.832359374 -0400
+@@ -58,10 +58,16 @@
+ 		CodecList.push_back(new NullCodec);
+ 
+ 		/* AAC */
++        /* Dream fix (radiotuna 2026-07-29): faad2 first.  Mainline fdk-aac
++           parses the DRM SDC type-9 config but cannot actually decode DRM30's
++           ER-AAC-SCAL core, so it claims AC_AAC and then fails every frame.
++           faad2 built with DRM_SUPPORT decodes legacy DRM AAC properly; its
++           CanDecode() returns false when the library is absent, so fdk-aac is
++           still the fallback, and fdk-aac remains the only xHE-AAC decoder. */
++        CodecList.push_back(new AacCodec);
+ #ifdef HAVE_LIBFDK_AAC
+         CodecList.push_back(new FdkAacCodec);
+ #endif
+-        CodecList.push_back(new AacCodec);
+ 
+ 		/* Opus */
+ 		CodecList.push_back(new OpusCodec);
+diff -ruN pristine/src/sourcedecoders/AudioSourceDecoder.cpp dreambuild/src/sourcedecoders/AudioSourceDecoder.cpp
+--- pristine/src/sourcedecoders/AudioSourceDecoder.cpp	2026-07-29 09:44:27.129707211 -0400
++++ dreambuild/src/sourcedecoders/AudioSourceDecoder.cpp	2026-07-29 09:28:30.158390491 -0400
+@@ -1,419 +1,423 @@
+-/******************************************************************************\
+- * Technische Universitaet Darmstadt, Institut fuer Nachrichtentechnik
+- * Copyright (c) 2001
+- *
+- * Author(s):
+- *	Volker Fischer
+- *
+- * Description:
+- *	Audio source encoder/decoder
+- *
+- ******************************************************************************
+- *
+- * This program is free software; you can redistribute it and/or modify it under
+- * the terms of the GNU General Public License as published by the Free Software
+- * Foundation; either version 2 of the License, or (at your option) any later
+- * version.
+- *
+- * This program is distributed in the hope that it will be useful, but WITHOUT
+- * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS
+- * FOR A PARTICULAR PURPOSE. See the GNU General Public License for more
+- * details.
+- *
+- * You should have received a copy of the GNU General Public License along with
+- * this program; if not, write to the Free Software Foundation, Inc.,
+- * 59 Temple Place, Suite 330, Boston, MA 02111-1307 USA
+- *
+-\******************************************************************************/
+-
+-#include "AudioSourceDecoder.h"
+-#include <iostream>
+-#include <sstream>
+-#include <string>
+-#include <algorithm>
+-#include <cmath>
+-#ifdef _WIN32
+-# include <direct.h>
+-#else
+-# include <sys/stat.h>
+-# include <sys/types.h>
+-#endif
+-
+-#include "../MSC/aacsuperframe.h"
+-#include "../MSC/xheaacsuperframe.h"
+-
+-/* Implementation *************************************************************/
+-
+-CAudioSourceDecoder::CAudioSourceDecoder()
+-    :	bWriteToFile(false), TextMessage(false),
+-      bUseReverbEffect(true), codec(nullptr)
+-{
+-    /* Initialize Audio Codec List */
+-    CAudioCodec::InitCodecList();
+-
+-    /* Needed by fdrmdialog.cpp to report missing codec */
+-    bCanDecodeAAC  = CAudioCodec::GetDecoder(CAudioParam::AC_AAC,  true) != nullptr;
+-    bCanDecodexHE_AAC = CAudioCodec::GetDecoder(CAudioParam::AC_xHE_AAC, true) != nullptr;
+-    bCanDecodeOPUS = CAudioCodec::GetDecoder(CAudioParam::AC_OPUS, true) != nullptr;
+-}
+-
+-CAudioSourceDecoder::~CAudioSourceDecoder()
+-{
+-    /* Unreference Audio Codec List */
+-    CAudioCodec::UnrefCodecList();
+-}
+-
+-
+-
+-void
+-CAudioSourceDecoder::ProcessDataInternal(CParameter & Parameters)
+-{
+-    bool bCurBlockOK;
+-    bool bGoodValues = false;
+-
+-
+-    Parameters.Lock();
+-    Parameters.vecbiAudioFrameStatus.Init(0);
+-    Parameters.vecbiAudioFrameStatus.ResetBitAccess();
+-    Parameters.Unlock();
+-
+-    /* Check if something went wrong in the initialization routine */
+-    if (DoNotProcessData)
+-    {
+-        return;
+-    }
+-
+-    //cerr << "got one logical frame of length " << pvecInputData->Size() << " bits" << endl;
+-
+-    /* Text Message ********************************************************** */
+-    if (bTextMessageUsed)
+-    {
+-        /* Decode last four bytes of input block for text message */
+-        for (int i = 0; i < SIZEOF__BYTE * NUM_BYTES_TEXT_MESS_IN_AUD_STR; i++)
+-            vecbiTextMessBuf[i] = (*pvecInputData)[iInputBlockSize - SIZEOF__BYTE * NUM_BYTES_TEXT_MESS_IN_AUD_STR + i];
+-
+-        TextMessage.Decode(vecbiTextMessBuf);
+-    }
+-
+-    /* Audio data header parsing ********************************************* */
+-    /* Check if audio shall not be decoded */
+-    if (DoNotProcessAudDecoder)
+-    {
+-        return;
+-    }
+-
+-    /* Reset bit extraction access */
+-    (*pvecInputData).ResetBitAccess();
+-
+-    bGoodValues = pAudioSuperFrame->parse(*pvecInputData);
+-
+-    /* Audio decoding ******************************************************** */
+-    /* Init output block size to zero, this variable is also used for
+-       determining the position for writing the output vector */
+-    iOutputBlockSize = 0;
+-    int iResOutBlockSize = 0;
+-    //cerr << "audio superframe with " << pAudioSuperFrame->getNumFrames() << " frames" << endl;
+-    for (unsigned j = 0; j < pAudioSuperFrame->getNumFrames(); j++)
+-    {
+-        bool bCodecUpdated = false;
+-        bool bCurBlockFaulty = false; // just for Opus or any other codec with FEC
+-
+-        if (bGoodValues)
+-        {
+-            CAudioCodec::EDecError eDecError;
+-            vector<uint8_t> audio_frame;
+-            uint8_t aac_crc_bits;
+-            pAudioSuperFrame->getFrame(audio_frame, aac_crc_bits, j);
+-            if(inputSampleRate != outputSampleRate) {
+-                eDecError = codec->Decode(audio_frame, aac_crc_bits, vecTempResBufInLeft, vecTempResBufInRight);
+-                if(eDecError==CAudioCodec::DECODER_ERROR_OK) {
+-                    /* Resample data */
+-                    iResOutBlockSize = outputSampleRate * vecTempResBufInLeft.Size() / inputSampleRate;
+-                    if(iResOutBlockSize != vecTempResBufOutCurLeft.Size()) { // NOOP for AAC, needed for xHE-AAC
+-                        vecTempResBufOutCurLeft.Init(iResOutBlockSize, 0.0);
+-                        vecTempResBufOutCurRight.Init(iResOutBlockSize, 0.0);
+-                        _REAL rRatio = _REAL(outputSampleRate) / _REAL(inputSampleRate);
+-                        ResampleObjL.Init(vecTempResBufInLeft.Size(), rRatio);
+-                        ResampleObjR.Init(vecTempResBufInLeft.Size(), rRatio);
+-                    }
+-
+-                    ResampleObjL.Resample(vecTempResBufInLeft, vecTempResBufOutCurLeft);
+-                    ResampleObjR.Resample(vecTempResBufInRight, vecTempResBufOutCurRight);
+-                }
+-            }
+-            else {
+-                eDecError = codec->Decode(audio_frame, aac_crc_bits, vecTempResBufOutCurLeft, vecTempResBufOutCurRight);
+-            }
+-
+-            iResOutBlockSize = vecTempResBufOutCurLeft.Size();
+-
+-            bCurBlockOK = (eDecError == CAudioCodec::DECODER_ERROR_OK);
+-
+-            /* Call decoder update */
+-            if (!bCodecUpdated)
+-            {
+-                bCodecUpdated = true;
+-                Parameters.Lock();
+-                int iCurSelAudioServ = Parameters.GetCurSelAudioService();
+-                codec->DecUpdate(Parameters.Service[unsigned(iCurSelAudioServ)].AudioParam);
+-                Parameters.Unlock();
+-            }
+-            /* OPH: add frame status to vector for RSCI */
+-            Parameters.Lock();
+-            Parameters.vecbiAudioFrameStatus.Add(eDecError == CAudioCodec::DECODER_ERROR_OK ? 0 : 1);
+-            Parameters.Unlock();
+-        }
+-        else
+-        {
+-            /* DRM super-frame header was wrong, set flag to "bad block" */
+-            bCurBlockOK = false;
+-            /* OPH: update audio status vector for RSCI */
+-            Parameters.Lock();
+-            Parameters.vecbiAudioFrameStatus.Add(1);
+-            Parameters.Unlock();
+-        }
+-
+-        // This code is independent of particular audio source type and should work with all codecs
+-
+-        /* Postprocessing of audio blocks, status informations -------------- */
+-        ETypeRxStatus status = reverb.apply(bCurBlockOK, bCurBlockFaulty, vecTempResBufOutCurLeft, vecTempResBufOutCurRight);
+-
+-        if (bCurBlockOK && !bCurBlockFaulty)
+-        {
+-            /* Increment correctly decoded audio blocks counter */
+-            iNumCorDecAudio++;
+-        }
+-
+-        {
+-            double l = 0.0, r = 0.0;
+-            for(int i=0; i<vecTempResBufOutCurLeft.Size(); i++) {
+-                l += vecTempResBufOutCurLeft[i];
+-                r += vecTempResBufOutCurRight[i];
+-            }
+-            //cerr << "energy after resampling and reverb left " << (l/vecTempResBufOutCurLeft.Size()) << " right " << (l/vecTempResBufOutCurRight.Size()) << endl;
+-        }
+-
+-        Parameters.Lock();
+-        Parameters.ReceiveStatus.SLAudio.SetStatus(status);
+-        Parameters.ReceiveStatus.LLAudio.SetStatus(status);
+-        Parameters.AudioComponentStatus[unsigned(Parameters.GetCurSelAudioService())].SetStatus(status);
+-        Parameters.Unlock();
+-
+-        /* Conversion from _REAL to _SAMPLE with special function */
+-        for (int i = 0; i < iResOutBlockSize; i++)
+-        {
+-            (*pvecOutputData)[iOutputBlockSize + i * 2] = Real2Sample(vecTempResBufOutCurLeft[i]);	/* Left channel */
+-            (*pvecOutputData)[iOutputBlockSize + i * 2 + 1] = Real2Sample(vecTempResBufOutCurRight[i]);	/* Right channel */
+-        }
+-
+-        /* Add new block to output block size ("* 2" for stereo output block) */
+-        iOutputBlockSize += iResOutBlockSize * 2;
+-
+-        if(iOutputBlockSize==0) {
+-            //cerr << "iOutputBlockSize is zero" << endl;
+-        }
+-        else {
+-            double d=0.0;
+-            for (int i = 0; i < iOutputBlockSize; i++)
+-            {
+-                double n = (*pvecOutputData)[i];
+-                d += n*n;
+-            }
+-            //cerr << "energy after converting " << iOutputBlockSize << " samples back to int " << sqrt(d/iOutputBlockSize) << endl;
+-        }
+-
+-    }
+-}
+-
+-void
+-CAudioSourceDecoder::InitInternal(CParameter & Parameters)
+-{
+-    /* Close previous decoder instance if any */
+-    CloseDecoder();
+-
+-    /* Init error flags and output block size parameter. The output block
+-       size is set in the processing routine. We must set it here in case
+-       of an error in the initialization, this part in the processing
+-       routine is not being called */
+-    DoNotProcessAudDecoder = false;
+-    DoNotProcessData = false;
+-    iOutputBlockSize = 0;
+-
+-    /* Set audiodecoder to empty string - means "unknown" and "can't decode" to GUI */
+-    audiodecoder = "";
+-
+-    try
+-    {
+-        Parameters.Lock();
+-
+-        /* Init counter for correctly decoded audio blocks */
+-        iNumCorDecAudio = 0;
+-
+-        /* Init "audio was ok" flag */
+-        bAudioWasOK = true;
+-
+-         /* Get number of total input bits for this module */
+-         iInputBlockSize = Parameters.iNumAudioDecoderBits;
+-
+-        /* Get current selected audio service */
+-        CService& service = Parameters.Service[unsigned(Parameters.GetCurSelAudioService())];
+-
+-        /* Get current audio coding */
+-        eAudioCoding = service.AudioParam.eAudioCoding;
+-
+-        /* The requirement for this module is that the stream is used and the service is an audio service. Check it here */
+-        if ((service.eAudDataFlag != CService::SF_AUDIO) || (service.AudioParam.iStreamID == STREAM_ID_NOT_USED))
+-        {
+-            throw CInitErr(ET_ALL);
+-        }
+-
+-        /* Current audio stream ID */
+-        unsigned curAudioStreamID =  unsigned(service.AudioParam.iStreamID);
+-
+-        int iTotalFrameSize = Parameters.Stream[curAudioStreamID].iLenPartA+Parameters.Stream[curAudioStreamID].iLenPartB;
+-
+-        /* Init text message application ------------------------------------ */
+-        if (service.AudioParam.bTextflag)
+-        {
+-            bTextMessageUsed = true;
+-
+-            /* Get a pointer to the string */
+-            TextMessage.Init(&service.AudioParam.strTextMessage);
+-
+-            /* Init vector for text message bytes */
+-            vecbiTextMessBuf.Init(SIZEOF__BYTE * NUM_BYTES_TEXT_MESS_IN_AUD_STR);
+-
+-            iTotalFrameSize -= NUM_BYTES_TEXT_MESS_IN_AUD_STR;
+-        }
+-        else {
+-            bTextMessageUsed = false;
+-        }
+-        if(eAudioCoding==CAudioParam::AC_xHE_AAC) {
+-            XHEAACSuperFrame* p = new XHEAACSuperFrame();
+-            // part B should be enough as xHE-AAC MUST be EEP but its easier to just add them
+-            p->init(service.AudioParam, unsigned(iTotalFrameSize));
+-            pAudioSuperFrame = p;
+-        }
+-        else {
+-            AACSuperFrame *p = new AACSuperFrame();
+-            p->init(service.AudioParam,  Parameters.GetWaveMode(), unsigned(Parameters.Stream[curAudioStreamID].iLenPartA), unsigned(Parameters.Stream[curAudioStreamID].iLenPartB));
+-            pAudioSuperFrame = p;
+-        }
+-        /* Get decoder instance */
+-        codec = CAudioCodec::GetDecoder(eAudioCoding);
+-
+-        if (codec->CanDecode(eAudioCoding))
+-            audiodecoder = codec->DecGetVersion();
+-
+-        if(bWriteToFile)
+-        {
+-            codec->openFile(Parameters);
+-        }
+-        else {
+-            codec->closeFile();
+-        }
+-
+-        codec->Init(service.AudioParam, iInputBlockSize);
+-
+-        /* Init decoder */
+-        codec->DecOpen(service.AudioParam, inputSampleRate);
+-        if (inputSampleRate == 0) {
+-            cerr << "DecOpen sample rate was zero - this should not happen" << endl;
+-            throw CInitErr(ET_AUDDECODER);
+-            //inputSampleRate = 12000; //mjf - 05May19 - stops this from dying in Mode C TODO
+-        }
+-
+-        int iLenDecOutPerChan = 0; // no need to use the one from the codec
+-        unsigned numFrames = unsigned(pAudioSuperFrame->getNumFrames());
+-        if(numFrames==0) {
+-            // xHE-AAC - can't tell yet!
+-        }
+-        else {
+-            int samplesPerChannelPerSuperFrame = int(pAudioSuperFrame->getSuperFrameDurationMilliseconds()) * inputSampleRate / 1000;
+-            iLenDecOutPerChan = samplesPerChannelPerSuperFrame / int(numFrames);
+-        }
+-
+-        /* set string for GUI */
+-        Parameters.audiodecoder = audiodecoder;
+-
+-        /* Set number of Audio frames for log file */
+-        // TODO Parameters.iNumAudioFrames = iNumAudioFrames;
+-
+-        outputSampleRate = Parameters.GetAudSampleRate();
+-        Parameters.Unlock();
+-
+-        /* Since we do not do Mode E or correct for sample rate offsets here (yet), we do not
+-           have to consider larger buffers. An audio frame always corresponds to 400 ms */
+-        int iMaxLenResamplerOutput = int(_REAL(outputSampleRate) * 0.4 /* 400ms */  * 2 /* for stereo */ );
+-
+-        if(inputSampleRate != outputSampleRate) {
+-            _REAL rRatio = _REAL(outputSampleRate) / _REAL(inputSampleRate);
+-            /* Init resample objects */
+-            ResampleObjL.Init(iLenDecOutPerChan, rRatio);
+-            ResampleObjR.Init(iLenDecOutPerChan, rRatio);
+-        }
+-
+-        int iResOutBlockSize = outputSampleRate * iLenDecOutPerChan / inputSampleRate;
+-
+-        //cerr << "output block size per channel " << iResOutBlockSize << " = samples " << iLenDecOutPerChan << " * " << Parameters.GetAudSampleRate() << " / " << iAudioSampleRate << endl;
+-
+-        /* Additional buffers needed for resampling since we need conversation
+-           between _REAL and _SAMPLE. We have to init the buffers with
+-           zeros since it can happen, that we have bad CRC right at the
+-           start of audio blocks */
+-        vecTempResBufInLeft.Init(iLenDecOutPerChan, 0.0);
+-        vecTempResBufInRight.Init(iLenDecOutPerChan, 0.0);
+-        vecTempResBufOutCurLeft.Init(iResOutBlockSize, 0.0);
+-        vecTempResBufOutCurRight.Init(iResOutBlockSize, 0.0);
+-
+-        reverb.Init(outputSampleRate, bUseReverbEffect);
+-
+-        /* With this parameter we define the maximum length of the output
+-           buffer. The cyclic buffer is only needed if we do a sample rate
+-           correction due to a difference compared to the transmitter. But for
+-           now we do not correct and we could stay with a single buffer
+-           Maybe TODO: sample rate correction to avoid audio dropouts */
+-        iMaxOutputBlockSize = iMaxLenResamplerOutput;
+-    }
+-
+-    catch(CInitErr CurErr)
+-    {
+-        Parameters.Unlock();
+-
+-        switch (CurErr.eErrType)
+-        {
+-        case ET_ALL:
+-            /* An init error occurred, do not process data in this module */
+-            DoNotProcessData = true;
+-            break;
+-
+-        case ET_AUDDECODER:
+-            /* Audio part should not be decoded, set flag */
+-            DoNotProcessAudDecoder = true;
+-            break;
+-        }
+-
+-        /* In all cases set output size to zero */
+-        iOutputBlockSize = 0;
+-    }
+-}
+-
+-int
+-CAudioSourceDecoder::GetNumCorDecAudio()
+-{
+-    /* Return number of correctly decoded audio blocks. Reset counter
+-       afterwards */
+-    const int iRet = iNumCorDecAudio;
+-
+-    iNumCorDecAudio = 0;
+-
+-    return iRet;
+-}
+-
+-void
+-CAudioSourceDecoder::CloseDecoder()
+-{
+-    if (codec != nullptr)
+-        codec->DecClose();
+-}
+-
++/******************************************************************************\
++ * Technische Universitaet Darmstadt, Institut fuer Nachrichtentechnik
++ * Copyright (c) 2001
++ *
++ * Author(s):
++ *	Volker Fischer
++ *
++ * Description:
++ *	Audio source encoder/decoder
++ *
++ ******************************************************************************
++ *
++ * This program is free software; you can redistribute it and/or modify it under
++ * the terms of the GNU General Public License as published by the Free Software
++ * Foundation; either version 2 of the License, or (at your option) any later
++ * version.
++ *
++ * This program is distributed in the hope that it will be useful, but WITHOUT
++ * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS
++ * FOR A PARTICULAR PURPOSE. See the GNU General Public License for more
++ * details.
++ *
++ * You should have received a copy of the GNU General Public License along with
++ * this program; if not, write to the Free Software Foundation, Inc.,
++ * 59 Temple Place, Suite 330, Boston, MA 02111-1307 USA
++ *
++\******************************************************************************/
++
++#include "AudioSourceDecoder.h"
++#include <iostream>
++#include <sstream>
++#include <string>
++#include <algorithm>
++#include <cmath>
++#ifdef _WIN32
++# include <direct.h>
++#else
++# include <sys/stat.h>
++# include <sys/types.h>
++#endif
++
++#include "../MSC/aacsuperframe.h"
++#include "../MSC/xheaacsuperframe.h"
++
++/* Implementation *************************************************************/
++
++CAudioSourceDecoder::CAudioSourceDecoder()
++    :	bWriteToFile(false), TextMessage(false),
++      bUseReverbEffect(true), codec(nullptr)
++{
++    /* Initialize Audio Codec List */
++    CAudioCodec::InitCodecList();
++
++    /* Needed by fdrmdialog.cpp to report missing codec */
++    bCanDecodeAAC  = CAudioCodec::GetDecoder(CAudioParam::AC_AAC,  true) != nullptr;
++    bCanDecodexHE_AAC = CAudioCodec::GetDecoder(CAudioParam::AC_xHE_AAC, true) != nullptr;
++    bCanDecodeOPUS = CAudioCodec::GetDecoder(CAudioParam::AC_OPUS, true) != nullptr;
++}
++
++CAudioSourceDecoder::~CAudioSourceDecoder()
++{
++    /* Unreference Audio Codec List */
++    CAudioCodec::UnrefCodecList();
++}
++
++
++
++void
++CAudioSourceDecoder::ProcessDataInternal(CParameter & Parameters)
++{
++    bool bCurBlockOK;
++    bool bGoodValues = false;
++
++
++    Parameters.Lock();
++    Parameters.vecbiAudioFrameStatus.Init(0);
++    Parameters.vecbiAudioFrameStatus.ResetBitAccess();
++    Parameters.Unlock();
++
++    /* Check if something went wrong in the initialization routine */
++    if (DoNotProcessData)
++    {
++        return;
++    }
++
++    //cerr << "got one logical frame of length " << pvecInputData->Size() << " bits" << endl;
++
++    /* Text Message ********************************************************** */
++    if (bTextMessageUsed)
++    {
++        /* Decode last four bytes of input block for text message */
++        for (int i = 0; i < SIZEOF__BYTE * NUM_BYTES_TEXT_MESS_IN_AUD_STR; i++)
++            vecbiTextMessBuf[i] = (*pvecInputData)[iInputBlockSize - SIZEOF__BYTE * NUM_BYTES_TEXT_MESS_IN_AUD_STR + i];
++
++        TextMessage.Decode(vecbiTextMessBuf);
++    }
++
++    /* Audio data header parsing ********************************************* */
++    /* Check if audio shall not be decoded */
++    if (DoNotProcessAudDecoder)
++    {
++        return;
++    }
++
++    /* Reset bit extraction access */
++    (*pvecInputData).ResetBitAccess();
++
++    bGoodValues = pAudioSuperFrame->parse(*pvecInputData);
++
++    /* Audio decoding ******************************************************** */
++    /* Init output block size to zero, this variable is also used for
++       determining the position for writing the output vector */
++    iOutputBlockSize = 0;
++    int iResOutBlockSize = 0;
++    //cerr << "audio superframe with " << pAudioSuperFrame->getNumFrames() << " frames" << endl;
++    for (unsigned j = 0; j < pAudioSuperFrame->getNumFrames(); j++)
++    {
++        bool bCodecUpdated = false;
++        bool bCurBlockFaulty = false; // just for Opus or any other codec with FEC
++
++        if (bGoodValues)
++        {
++            CAudioCodec::EDecError eDecError;
++            vector<uint8_t> audio_frame;
++            uint8_t aac_crc_bits;
++            pAudioSuperFrame->getFrame(audio_frame, aac_crc_bits, j);
++            if(inputSampleRate != outputSampleRate) {
++                eDecError = codec->Decode(audio_frame, aac_crc_bits, vecTempResBufInLeft, vecTempResBufInRight);
++                if(eDecError==CAudioCodec::DECODER_ERROR_OK) {
++                    /* Resample data */
++                    iResOutBlockSize = outputSampleRate * vecTempResBufInLeft.Size() / inputSampleRate;
++                    if(iResOutBlockSize != vecTempResBufOutCurLeft.Size()) { // NOOP for AAC, needed for xHE-AAC
++                        vecTempResBufOutCurLeft.Init(iResOutBlockSize, 0.0);
++                        vecTempResBufOutCurRight.Init(iResOutBlockSize, 0.0);
++                        _REAL rRatio = _REAL(outputSampleRate) / _REAL(inputSampleRate);
++                        ResampleObjL.Init(vecTempResBufInLeft.Size(), rRatio);
++                        ResampleObjR.Init(vecTempResBufInLeft.Size(), rRatio);
++                    }
++
++                    ResampleObjL.Resample(vecTempResBufInLeft, vecTempResBufOutCurLeft);
++                    ResampleObjR.Resample(vecTempResBufInRight, vecTempResBufOutCurRight);
++                }
++            }
++            else {
++                eDecError = codec->Decode(audio_frame, aac_crc_bits, vecTempResBufOutCurLeft, vecTempResBufOutCurRight);
++            }
++
++            iResOutBlockSize = vecTempResBufOutCurLeft.Size();
++
++            bCurBlockOK = (eDecError == CAudioCodec::DECODER_ERROR_OK);
++
++            /* Call decoder update */
++            if (!bCodecUpdated)
++            {
++                bCodecUpdated = true;
++                Parameters.Lock();
++                int iCurSelAudioServ = Parameters.GetCurSelAudioService();
++                codec->DecUpdate(Parameters.Service[unsigned(iCurSelAudioServ)].AudioParam);
++                Parameters.Unlock();
++            }
++            /* OPH: add frame status to vector for RSCI */
++            Parameters.Lock();
++            Parameters.vecbiAudioFrameStatus.Add(eDecError == CAudioCodec::DECODER_ERROR_OK ? 0 : 1);
++            Parameters.Unlock();
++        }
++        else
++        {
++            /* DRM super-frame header was wrong, set flag to "bad block" */
++            bCurBlockOK = false;
++            /* OPH: update audio status vector for RSCI */
++            Parameters.Lock();
++            Parameters.vecbiAudioFrameStatus.Add(1);
++            Parameters.Unlock();
++        }
++
++        // This code is independent of particular audio source type and should work with all codecs
++
++        /* Postprocessing of audio blocks, status informations -------------- */
++        ETypeRxStatus status = reverb.apply(bCurBlockOK, bCurBlockFaulty, vecTempResBufOutCurLeft, vecTempResBufOutCurRight);
++
++        if (bCurBlockOK && !bCurBlockFaulty)
++        {
++            /* Increment correctly decoded audio blocks counter */
++            iNumCorDecAudio++;
++        }
++
++        {
++            double l = 0.0, r = 0.0;
++            for(int i=0; i<vecTempResBufOutCurLeft.Size(); i++) {
++                l += vecTempResBufOutCurLeft[i];
++                r += vecTempResBufOutCurRight[i];
++            }
++            //cerr << "energy after resampling and reverb left " << (l/vecTempResBufOutCurLeft.Size()) << " right " << (l/vecTempResBufOutCurRight.Size()) << endl;
++        }
++
++        Parameters.Lock();
++        Parameters.ReceiveStatus.SLAudio.SetStatus(status);
++        Parameters.ReceiveStatus.LLAudio.SetStatus(status);
++        Parameters.AudioComponentStatus[unsigned(Parameters.GetCurSelAudioService())].SetStatus(status);
++        Parameters.Unlock();
++
++        /* Conversion from _REAL to _SAMPLE with special function */
++        for (int i = 0; i < iResOutBlockSize; i++)
++        {
++            (*pvecOutputData)[iOutputBlockSize + i * 2] = Real2Sample(vecTempResBufOutCurLeft[i]);	/* Left channel */
++            (*pvecOutputData)[iOutputBlockSize + i * 2 + 1] = Real2Sample(vecTempResBufOutCurRight[i]);	/* Right channel */
++        }
++
++        /* Add new block to output block size ("* 2" for stereo output block) */
++        iOutputBlockSize += iResOutBlockSize * 2;
++
++        if(iOutputBlockSize==0) {
++            //cerr << "iOutputBlockSize is zero" << endl;
++        }
++        else {
++            double d=0.0;
++            for (int i = 0; i < iOutputBlockSize; i++)
++            {
++                double n = (*pvecOutputData)[i];
++                d += n*n;
++            }
++            //cerr << "energy after converting " << iOutputBlockSize << " samples back to int " << sqrt(d/iOutputBlockSize) << endl;
++        }
++
++    }
++}
++
++void
++CAudioSourceDecoder::InitInternal(CParameter & Parameters)
++{
++    /* Close previous decoder instance if any */
++    CloseDecoder();
++
++    /* Init error flags and output block size parameter. The output block
++       size is set in the processing routine. We must set it here in case
++       of an error in the initialization, this part in the processing
++       routine is not being called */
++    DoNotProcessAudDecoder = false;
++    DoNotProcessData = false;
++    iOutputBlockSize = 0;
++
++    /* Set audiodecoder to empty string - means "unknown" and "can't decode" to GUI */
++    audiodecoder = "";
++
++    try
++    {
++        Parameters.Lock();
++
++        /* Init counter for correctly decoded audio blocks */
++        iNumCorDecAudio = 0;
++
++        /* Init "audio was ok" flag */
++        bAudioWasOK = true;
++
++         /* Get number of total input bits for this module */
++         iInputBlockSize = Parameters.iNumAudioDecoderBits;
++
++        /* Get current selected audio service */
++        CService& service = Parameters.Service[unsigned(Parameters.GetCurSelAudioService())];
++
++        /* Get current audio coding */
++        eAudioCoding = service.AudioParam.eAudioCoding;
++
++        /* The requirement for this module is that the stream is used and the service is an audio service. Check it here */
++        if ((service.eAudDataFlag != CService::SF_AUDIO) || (service.AudioParam.iStreamID == STREAM_ID_NOT_USED))
++        {
++            throw CInitErr(ET_ALL);
++        }
++
++        /* Current audio stream ID */
++        unsigned curAudioStreamID =  unsigned(service.AudioParam.iStreamID);
++
++        int iTotalFrameSize = Parameters.Stream[curAudioStreamID].iLenPartA+Parameters.Stream[curAudioStreamID].iLenPartB;
++
++        /* Init text message application ------------------------------------ */
++        if (service.AudioParam.bTextflag)
++        {
++            bTextMessageUsed = true;
++
++            /* Get a pointer to the string */
++            TextMessage.Init(&service.AudioParam.strTextMessage);
++
++            /* Init vector for text message bytes */
++            vecbiTextMessBuf.Init(SIZEOF__BYTE * NUM_BYTES_TEXT_MESS_IN_AUD_STR);
++
++            iTotalFrameSize -= NUM_BYTES_TEXT_MESS_IN_AUD_STR;
++        }
++        else {
++            bTextMessageUsed = false;
++        }
++        if(eAudioCoding==CAudioParam::AC_xHE_AAC) {
++            XHEAACSuperFrame* p = new XHEAACSuperFrame();
++            // part B should be enough as xHE-AAC MUST be EEP but its easier to just add them
++            p->init(service.AudioParam, unsigned(iTotalFrameSize));
++            pAudioSuperFrame = p;
++        }
++        else {
++            AACSuperFrame *p = new AACSuperFrame();
++            p->init(service.AudioParam,  Parameters.GetWaveMode(), unsigned(Parameters.Stream[curAudioStreamID].iLenPartA), unsigned(Parameters.Stream[curAudioStreamID].iLenPartB));
++            pAudioSuperFrame = p;
++        }
++        /* Get decoder instance */
++        codec = CAudioCodec::GetDecoder(eAudioCoding);
++
++        if (codec->CanDecode(eAudioCoding))
++            audiodecoder = codec->DecGetVersion();
++
++        if(bWriteToFile)
++        {
++            codec->openFile(Parameters);
++        }
++        else {
++            codec->closeFile();
++        }
++
++        codec->Init(service.AudioParam, iInputBlockSize);
++
++        /* Init decoder */
++        codec->DecOpen(service.AudioParam, inputSampleRate);
++        if (inputSampleRate == 0) {
++            cerr << "DecOpen sample rate was zero - this should not happen" << endl;
++            throw CInitErr(ET_AUDDECODER);
++            //inputSampleRate = 12000; //mjf - 05May19 - stops this from dying in Mode C TODO
++        }
++
++        int iLenDecOutPerChan = 0; // no need to use the one from the codec
++        unsigned numFrames = unsigned(pAudioSuperFrame->getNumFrames());
++        if(numFrames==0) {
++            // xHE-AAC - can't tell yet!
++        }
++        else {
++            int samplesPerChannelPerSuperFrame = int(pAudioSuperFrame->getSuperFrameDurationMilliseconds()) * inputSampleRate / 1000;
++            iLenDecOutPerChan = samplesPerChannelPerSuperFrame / int(numFrames);
++        }
++
++        /* set string for GUI */
++        Parameters.audiodecoder = audiodecoder;
++
++        /* Set number of Audio frames for log file */
++        // TODO Parameters.iNumAudioFrames = iNumAudioFrames;
++
++        outputSampleRate = Parameters.GetAudSampleRate();
++        Parameters.Unlock();
++
++        /* Since we do not do Mode E or correct for sample rate offsets here (yet), we do not
++           have to consider larger buffers. An audio frame always corresponds to 400 ms */
++        /* xHE fix: xHE-AAC frames are not aligned to the DRM super frame, so a
++           single decode can deliver more than 400 ms - double the buffer. */
++        int iMaxLenResamplerOutput = int(_REAL(outputSampleRate) * 0.4 /* 400ms */  * 2 /* for stereo */ * 2 );
++
++        if(inputSampleRate != outputSampleRate) {
++            _REAL rRatio = _REAL(outputSampleRate) / _REAL(inputSampleRate);
++            /* Init resample objects */
++            ResampleObjL.Init(iLenDecOutPerChan, rRatio);
++            ResampleObjR.Init(iLenDecOutPerChan, rRatio);
++        }
++
++        int iResOutBlockSize = iLenDecOutPerChan;
++        if (inputSampleRate != 0)
++            iResOutBlockSize = outputSampleRate * iLenDecOutPerChan / inputSampleRate;
++
++        //cerr << "output block size per channel " << iResOutBlockSize << " = samples " << iLenDecOutPerChan << " * " << Parameters.GetAudSampleRate() << " / " << iAudioSampleRate << endl;
++
++        /* Additional buffers needed for resampling since we need conversation
++           between _REAL and _SAMPLE. We have to init the buffers with
++           zeros since it can happen, that we have bad CRC right at the
++           start of audio blocks */
++        vecTempResBufInLeft.Init(iLenDecOutPerChan, 0.0);
++        vecTempResBufInRight.Init(iLenDecOutPerChan, 0.0);
++        vecTempResBufOutCurLeft.Init(iResOutBlockSize, 0.0);
++        vecTempResBufOutCurRight.Init(iResOutBlockSize, 0.0);
++
++        reverb.Init(outputSampleRate, bUseReverbEffect);
++
++        /* With this parameter we define the maximum length of the output
++           buffer. The cyclic buffer is only needed if we do a sample rate
++           correction due to a difference compared to the transmitter. But for
++           now we do not correct and we could stay with a single buffer
++           Maybe TODO: sample rate correction to avoid audio dropouts */
++        iMaxOutputBlockSize = iMaxLenResamplerOutput;
++    }
++
++    catch(CInitErr CurErr)
++    {
++        Parameters.Unlock();
++
++        switch (CurErr.eErrType)
++        {
++        case ET_ALL:
++            /* An init error occurred, do not process data in this module */
++            DoNotProcessData = true;
++            break;
++
++        case ET_AUDDECODER:
++            /* Audio part should not be decoded, set flag */
++            DoNotProcessAudDecoder = true;
++            break;
++        }
++
++        /* In all cases set output size to zero */
++        iOutputBlockSize = 0;
++    }
++}
++
++int
++CAudioSourceDecoder::GetNumCorDecAudio()
++{
++    /* Return number of correctly decoded audio blocks. Reset counter
++       afterwards */
++    const int iRet = iNumCorDecAudio;
++
++    iNumCorDecAudio = 0;
++
++    return iRet;
++}
++
++void
++CAudioSourceDecoder::CloseDecoder()
++{
++    if (codec != nullptr)
++        codec->DecClose();
++}
++
+diff -ruN pristine/src/sourcedecoders/aac_codec.cpp dreambuild/src/sourcedecoders/aac_codec.cpp
+--- pristine/src/sourcedecoders/aac_codec.cpp	2026-07-29 09:44:27.091618796 -0400
++++ dreambuild/src/sourcedecoders/aac_codec.cpp	2026-07-29 09:20:11.831203898 -0400
+@@ -212,7 +212,6 @@
+ CAudioCodec::EDecError
+ AacCodec::Decode(const vector<uint8_t>& audio_frame, uint8_t aac_crc_bits, CVector<_REAL>& left, CVector<_REAL>& right)
+ {
+-    EDecError eDecError;
+     bool bCurBlockOK = true;
+     _SAMPLE* psDecOutSampleBuf = nullptr;
+     NeAACDecFrameInfo DecFrameInfo;
+@@ -247,6 +246,7 @@
+         {
+             //cerr << "resample " << iLenDecOutPerChan << " mono samples" << endl;
+             /* Change type of data (short -> real) */
++            if (iLenDecOutPerChan > left.Size()) iLenDecOutPerChan = left.Size();
+             for (size_t i = 0; i < size_t(iLenDecOutPerChan); i++) {
+                 left[int(i)] = psDecOutSampleBuf[i];
+                 right[int(i)] = psDecOutSampleBuf[i];
+@@ -257,6 +257,7 @@
+         {
+             /* Stereo */
+             //cerr << "resample " << iLenDecOutPerChan << " stereo samples" << endl;
++            if (iLenDecOutPerChan > left.Size()) iLenDecOutPerChan = left.Size();
+             for (size_t i = 0; i < size_t(iLenDecOutPerChan); i++)
+             {
+                 left[i] = psDecOutSampleBuf[i * 2];
+@@ -264,6 +265,12 @@
+             }
+         }
+     }
++    /* Dream fix (radiotuna 2026-07-29): the original AacCodec::Decode() falls
++       off the end of the function without returning a value, so the caller
++       compares uninitialised garbage against DECODER_ERROR_OK and throws every
++       decoded frame away.  Report success explicitly. */
++    (void)bCurBlockOK;
++    return CAudioCodec::DECODER_ERROR_OK;
+ }
+ 
+ void
+diff -ruN pristine/src/sourcedecoders/fdk_aac_codec.cpp dreambuild/src/sourcedecoders/fdk_aac_codec.cpp
+--- pristine/src/sourcedecoders/fdk_aac_codec.cpp	2026-07-29 09:44:27.034045479 -0400
++++ dreambuild/src/sourcedecoders/fdk_aac_codec.cpp	2026-07-29 09:32:06.089204661 -0400
+@@ -235,7 +235,8 @@
+     type9Size = unsigned(type9.size());
+     t9 = &type9[0];
+ 
+-    //cerr << "type9 " << hex; for(size_t i=0; i<type9Size; i++) cerr << int(type9[i]) << " "; cerr << dec << endl;
++    cerr << "type9(" << type9Size << ") " << hex; for(size_t i=0; i<type9Size; i++) cerr << int(type9[i]) << " "; cerr << dec << endl;
++    cerr << "AudioParam coding=" << int(AudioParam.eAudioCoding) << " srate=" << int(AudioParam.eAudioSamplRate) << " mode=" << int(AudioParam.eAudioMode) << " sbr=" << int(AudioParam.eSBRFlag) << endl;
+     AAC_DECODER_ERROR err = aacDecoder_ConfigRaw (hDecoder, &t9, &type9Size);
+     if(err == AAC_DEC_OK) {
+         CStreamInfo *pinfo = aacDecoder_GetStreamInfo(hDecoder);
+@@ -247,7 +248,7 @@
+         cerr << "DecOpen";
+         logAOT(*pinfo);
+         logFlags(*pinfo);
+-        //logNumbers(*pinfo);
++        logNumbers(*pinfo);
+         cerr << endl;
+         iAudioSampleRate = pinfo->extSamplingRate;
+ 
+@@ -308,7 +309,7 @@
+     //cerr << endl;
+ 
+     if(pinfo->aacNumChannels == 0) {
+-        cerr << "zero output channels: " << err << endl;
++        //cerr << "zero output channels: " << err << endl;
+         //return CAudioCodec::DECODER_ERROR_UNKNOWN;
+     }
+     else {
+@@ -326,11 +327,20 @@
+     }
+ 
+     if(pinfo->numChannels == 0) {
+-        cerr << "zero output channels: " << err << endl;
++        //cerr << "zero output channels: " << err << endl;
+         //return CAudioCodec::DECODER_ERROR_UNKNOWN;
+     }
+ 
+     size_t output_size = unsigned(pinfo->frameSize * pinfo->numChannels);
++    /* Dream/fdk fix (radiotuna 2026-07-29): fdk-aac only populates
++       CStreamInfo::frameSize / numChannels after the FIRST successful
++       aacDecoder_DecodeFrame().  For DRM mono AAC without SBR they are still
++       zero at this point, so the original code handed DecodeFrame a
++       zero-length output buffer and every frame failed.  Offer the whole
++       buffer when the size is not known yet. */
++    if(output_size == 0) {
++        output_size = sizeof(decode_buf)/sizeof(decode_buf[0]);
++    }
+     if(sizeof (decode_buf) < sizeof(int16_t)*output_size) {
+         cerr << "can't fit output into decoder buffer" << endl;
+         return CAudioCodec::DECODER_ERROR_UNKNOWN;
+@@ -367,6 +377,14 @@
+         return CAudioCodec::DECODER_ERROR_UNKNOWN;
+     }
+ 
++    /* Dream/fdk fix: re-read the stream info - frameSize / numChannels are
++       only valid after the decode call above. */
++    pinfo = aacDecoder_GetStreamInfo(hDecoder);
++    if (pinfo == nullptr || pinfo->frameSize <= 0 || pinfo->numChannels <= 0) {
++        cerr << "no valid stream info after decode" << endl;
++        return CAudioCodec::DECODER_ERROR_UNKNOWN;
++    }
++
+     left.Init(pinfo->frameSize, 0.0);
+     right.Init(pinfo->frameSize, 0.0);
+ 
