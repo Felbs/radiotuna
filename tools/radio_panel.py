@@ -826,7 +826,26 @@ def iono_summary():
 # Day/night tinting uses a COARSE REGIONAL grid point for the mid-
 # Atlantic US — it is deliberately NOT the station's location, only
 # enough geometry to know roughly when the sun is up over the region.
-ATLAS_LAT, ATLAS_LON = 38.5, -77.5        # regional, coarse, not a QTH
+def _atlas_observer():
+    """Observer location for the heatmap's sunrise/sunset overlay, from the
+    repo's standing private-location convention (am_db.py): RT_QTH='lat,lon'
+    in the environment, else a gitignored lab/qth.txt. NO coordinates ship in
+    this file - without a configured QTH the sun overlay is simply omitted,
+    which is also the right default for anyone else running this panel."""
+    v = os.environ.get("RT_QTH", "")
+    if not v:
+        try:
+            v = (LAB / "qth.txt").read_text().strip()
+        except Exception:
+            v = ""
+    try:
+        la, lo = (float(x) for x in v.split(",")[:2])
+        return la, lo
+    except Exception:
+        return None, None
+
+
+ATLAS_LAT, ATLAS_LON = _atlas_observer()
 
 #         span : (window hours, bucket hours, n buckets)
 ATLAS_SPANS = {"day":   (24,        1.0,       24),
@@ -838,8 +857,12 @@ ATLAS_ALIVE_Q = 18                        # prop_atlas.py's listenable line
 
 
 def _sun_elev_deg(dt):
-    """Low-precision solar elevation (deg) over the regional grid point.
-    Good to ~0.5 deg — plenty to shade a heatmap day from night."""
+    """Low-precision solar elevation (deg) at the configured observer.
+    Good to ~0.5 deg — plenty to shade a heatmap day from night. Returns
+    None when no QTH is configured (see _atlas_observer): the heatmap then
+    renders without sun shading rather than inventing a location."""
+    if ATLAS_LAT is None or ATLAS_LON is None:
+        return None
     import math
     from datetime import datetime as _dt, timezone as _tz
     n = (dt - _dt(2000, 1, 1, 12, tzinfo=_tz.utc)).total_seconds() / 86400.0
@@ -2449,7 +2472,7 @@ rgba(0,229,255,.35);border-radius:6px;margin:10px 0;padding:8px">
     <span>QUALITY</span><span>0</span><span id="at-ramp"></span><span>90</span>
     <span><span class="at-sw" style="background:#191720"></span>no sweep</span>
     <span><span class="at-sw" style="background:linear-gradient(90deg,#0b1030,#e0a14a)"></span>
-      night &rarr; day (regional sun, coarse)</span>
+      night &rarr; day (sun strip: set RT_QTH to enable)</span>
     <span>faded cell = fewer samples in that bucket</span>
   </div>
   <div id="at-note"></div>
@@ -2958,7 +2981,10 @@ function atDraw(hr,hc){
   for(const row of j.n)for(const v of row)if(v>0)ns.push(v);
   ns.sort((a,b)=>a-b);
   const nRef=ns.length?ns[Math.floor(ns.length*0.6)]:1;
-  for(let ci=0;ci<G.nc;ci++){            /* sun strip: night → day */
+  /* sun strip: night → day. Omitted entirely when no QTH is configured
+     (server sends sun:null) — the panel never invents a location. */
+  const haveSun=j.cols.length&&j.cols[0].sun!==null&&j.cols[0].sun!==undefined;
+  if(haveSun)for(let ci=0;ci<G.nc;ci++){
     g.fillStyle=atSunCol(j.cols[ci].sun);
     g.fillRect(x0+ci*G.cw,y0-14,G.cw,9);}
   for(let ri=0;ri<G.nr;ri++)for(let ci=0;ci<G.nc;ci++){
@@ -2969,7 +2995,7 @@ function atDraw(hr,hc){
     const rgb=atCol(q/90),a=0.42+0.58*Math.min(1,n/nRef);
     g.fillStyle='rgba('+rgb[0]+','+rgb[1]+','+rgb[2]+','+a.toFixed(2)+')';
     g.fillRect(x,y,G.cw-0.5,G.ch-0.5);}
-  for(let ci=1;ci<G.nc;ci++){            /* terminator crossings */
+  if(haveSun)for(let ci=1;ci<G.nc;ci++){ /* terminator crossings */
     const a=j.cols[ci-1].sun,b=j.cols[ci].sun;
     if((a<0)!==(b<0)){
       const x=x0+ci*G.cw;g.save();g.setLineDash([3,3]);
