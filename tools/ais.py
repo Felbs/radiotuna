@@ -36,7 +36,12 @@ HERE = Path(__file__).resolve().parent
 LAB = HERE.parent / "lab"
 LAB.mkdir(exist_ok=True)
 
-FS = 250_000.0
+FS = 250_000.0  # rate-ok: DEMOD rate only - capture happens at FS_SDR below,
+#                 decimated 125/1024 down to FS right after the grab
+# CAPTURE AT 2.048M, NEVER 250k (law 8/01): the RSPdx 250 kS/s path delivers
+# phase-corrupt, amplitude-suppressed IQ on this box - fatal to GMSK phase
+# demod. Capture high, decimate in software, once, at the top.
+FS_SDR = 2_048_000.0
 CENTER = 162.000e6
 CHAN_OFF = {"A": -25_000.0, "B": +25_000.0}   # 161.975 / 162.025
 BAUD = 9600.0
@@ -331,7 +336,7 @@ def cmd_capture(args):
     from SoapySDR import SOAPY_SDR_RX, SOAPY_SDR_CS16
     SoapySDR.SoapySDR_setLogLevel(SoapySDR.SOAPY_SDR_FATAL)
     sdr = SoapySDR.Device("driver=sdrplay")
-    sdr.setSampleRate(SOAPY_SDR_RX, 0, FS)
+    sdr.setSampleRate(SOAPY_SDR_RX, 0, FS_SDR)
     sdr.setFrequency(SOAPY_SDR_RX, 0, CENTER)
     try:
         sdr.setAntenna(SOAPY_SDR_RX, 0, args.antenna)
@@ -347,7 +352,7 @@ def cmd_capture(args):
     sdr.activateStream(st)
     print(f"[capture] {args.secs:.0f}s @ 162.000 MHz (both AIS channels) "
           f"on {args.antenna}")
-    n_want = int(args.secs * FS)
+    n_want = int(args.secs * FS_SDR)
     buf = np.empty(2 * 65536, np.int16)
     out = np.empty(2 * n_want, np.int16)
     got = 0
@@ -363,6 +368,10 @@ def cmd_capture(args):
     sdr.closeStream(st)
     iq = ((out[0::2].astype(np.float32) + 1j * out[1::2].astype(np.float32))
           / 32768.0).astype(np.complex64)[:got]
+    # decimate 2.048M -> 250k (exact 125/1024); every downstream sample-rate
+    # assumption (FS) is unchanged - the rate conversion happens once, here.
+    from scipy.signal import resample_poly
+    iq = resample_poly(iq, 125, 1024).astype(np.complex64)
     print(f"[capture] {len(iq)/FS:.1f}s captured, demodulating A+B ...")
     ships = {}
     counts = {}

@@ -125,7 +125,9 @@ def cmd_capture(args):
     buf = np.empty(2 * 65536, np.int16)
     stamp = time.strftime("%H%M%S")
     out = LAB / f"hd_{str(args.mhz).replace('.', '')}_{stamp}.cu8"
+    # integrity-gated below: wall time vs sample count (law 7/31)
     got = 0
+    t0 = time.time()
     with open(out, "wb") as f:
         while got < n_want:
             r = sdr.readStream(st, [buf], 65536, timeoutUs=500000)
@@ -135,6 +137,13 @@ def cmd_capture(args):
                 got += n
     sdr.deactivateStream(st)
     sdr.closeStream(st)
+    wall = time.time() - t0
+    # capture-integrity gate (law 7/31: 90 s of WSHE held 45 s of samples and
+    # faked a campaign number): a sample-bounded loop hides drops as extra
+    # wall time - a time-warped capture is not a capture.
+    if wall > args.secs * 1.5 + 3:
+        print(f"WARNING: {got / FS_CAP:.1f}s of samples took {wall:.1f}s "
+              f"wall - stream under-delivering; capture is time-warped")
     print(f"captured {got / FS_CAP:.1f}s -> {out}")
     return out
 
@@ -196,7 +205,9 @@ def cmd_live(args):
     reads it as a file that keeps growing; audio WAV also grows and mpv
     tails it. Latency ~2-4 s. Ctrl+C stops."""
     sdr, st, RX = open_sdr(args.mhz)
-    iq_path = LAB / "hd_live.cu8"
+    iq_path = LAB / "hd_live.cu8"   # gate-ok: live rolling stream - the
+    # consumer (nrsc5 tailing the file) surfaces starvation as lost
+    # sync/MER in real time; a wall*fs gate has no fixed window here
     wav = LAB / "hd_live.wav"
     for f in (iq_path, wav):
         try:

@@ -190,7 +190,8 @@ def _open_sdr():
             import subprocess
             subprocess.run(["powershell", "-NoProfile", "-Command",
                             "Restart-Service SDRplayAPIService"],
-                           capture_output=True, timeout=60)
+                           capture_output=True, timeout=60)  # pipe-ok:
+            # Restart-Service emits nothing we read - capture only mutes it
             time.sleep(8)
         time.sleep(5)
     if sdr is None:

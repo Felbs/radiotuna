@@ -37,7 +37,8 @@ LAB = HERE.parent / "lab"
 LAB.mkdir(exist_ok=True)
 CURVE = LAB / "hf_curve.csv"
 
-FS = 250_000.0
+FS = 250_000.0  # rate-ok: HF band-POWER survey (magnitude-only PSD bins, no
+#                 phase demod) on the same verified 250k HF path as cw.py
 
 FT8 = [("FT8-80m", 3.573e6), ("FT8-40m", 7.074e6), ("FT8-30m", 10.136e6),
        ("FT8-20m", 14.074e6), ("FT8-17m", 18.100e6), ("FT8-15m", 21.074e6),

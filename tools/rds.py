@@ -24,7 +24,9 @@ from pathlib import Path
 
 import numpy as np
 
-FS = 250000.0
+FS = 250000.0  # rate-ok: offline decoder of .cs16 FILES (no SDR open here);
+#                the rate must match the capture's. LIVE RDS captures must be
+#                made at >=2.048M (law 8/01) and passed via --fs.
 RBPS = 1187.5
 # RDS offset words A,B,C,D (added to the 10-bit checkword per block type)
 OFFSET = {"A": 0x0FC, "B": 0x198, "C": 0x168, "Cp": 0x350, "D": 0x1B4}

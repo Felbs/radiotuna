@@ -402,7 +402,8 @@ def heal_sdr_service():
     automatically instead of telling the human the radio is haunted."""
     subprocess.run(["powershell", "-NoProfile", "-Command",
                     "Restart-Service SDRplayAPIService -Force"],
-                   capture_output=True, timeout=90)
+                   capture_output=True, timeout=90)  # pipe-ok: Restart-Service
+    # emits nothing we read - capture_output only mutes console noise
     time.sleep(6)
     # burn the post-restart dud session (law: the first session after
     # a service restart streams deaf; the lab burns one, so do we)
@@ -472,8 +473,12 @@ def stop_listen():
         except Exception:
             pass
     LIVE_PROCS.clear()
-    subprocess.run(["taskkill", "/F", "/IM", "mpv.exe"], capture_output=True)
-    subprocess.run(["taskkill", "/F", "/IM", "nrsc5.exe"],
+    # kill-ok x2: mpv/nrsc5 here are audio players / pipe consumers, never
+    # the SDR holder - the panel process itself owns the stream and closes
+    # it via close_sdr(); terminate() above was the graceful pass
+    subprocess.run(["taskkill", "/F", "/IM", "mpv.exe"],  # kill-ok (player)
+                   capture_output=True)
+    subprocess.run(["taskkill", "/F", "/IM", "nrsc5.exe"],  # kill-ok (pipe consumer)
                    capture_output=True)
 
 
@@ -1291,6 +1296,15 @@ def am_hd_try(khz):
             d.deactivateStream(st)
             d.closeStream(st)
             x = np.concatenate(ch).astype(np.complex64)
+            # capture-integrity gate (law 7/31): a time-bounded loop can
+            # silently drop samples - 90 s of WSHE once held 45 s and faked
+            # a campaign number. samples must match wall*fs before decoding.
+            if len(x) < 0.9 * 45 * FSC:
+                BAND["am_hd"] = {
+                    "stage": "error",
+                    "verdict": (f"capture dropped samples ({len(x)/FSC:.1f}s "
+                                f"of 45s) - do not trust a verdict; retry")}
+                return
             BAND["am_hd"] = {"stage": "filtering + cu8..."}
             nn = np.arange(len(x), dtype=np.float64)
             x = (x * np.exp(-2j * np.pi * (target - center) / FSC * nn)
@@ -1305,7 +1319,7 @@ def am_hd_try(khz):
                          ).clip(0, 255).astype(np.uint8)
             cu8[1::2] = ((i16q.astype(np.int32) >> 8) + 128
                          ).clip(0, 255).astype(np.uint8)
-            cap = LAB / "am_hd_try.cu8"
+            cap = LAB / "am_hd_try.cu8"   # integrity gate above (sample count)
             cu8.tofile(cap)
             wav = LAB / "am_hd_try.wav"
             BAND["am_hd"] = {"stage": "albacore --am decoding..."}
@@ -1400,8 +1414,9 @@ def hd_probe(mhz, secs=8):
     sdr, st = open_sdr(mhz, ifgr=59, rfgain="3")
     n_want = int(secs * FS_CAP)
     buf = np.empty(2 * 65536, np.int16)
-    iq = LAB / "probe.cu8"
+    iq = LAB / "probe.cu8"   # integrity: sample-bounded loop + wall gate below
     got = 0
+    t0 = time.time()
     with open(iq, "wb") as f:
         while got < n_want:
             r = sdr.readStream(st, [buf], 65536, timeoutUs=500000)
@@ -1410,6 +1425,12 @@ def hd_probe(mhz, secs=8):
                 f.write(cs16_to_cu8(decimate2(buf[:2 * n])).tobytes())
                 got += n
     close_sdr(sdr, st)
+    # capture-integrity gate (law 7/31): a sample-bounded loop hides drops as
+    # EXTRA WALL TIME - a time-warped probe fakes the HD verdict. Flag it.
+    if time.time() - t0 > secs * 1.5 + 3:
+        print(f"[hd_probe] WARNING: {secs:.0f}s of samples took "
+              f"{time.time() - t0:.1f}s wall - stream under-delivering, "
+              f"probe verdict untrustworthy", flush=True)
     info = {"hd": False, "name": None, "slogan": None, "programs": {},
             "mer_lo": None, "mer_hi": None, "ber": None}
     aas = LAB / "aas_guide" / f"{mhz:.1f}"
@@ -3750,6 +3771,8 @@ class H(BaseHTTPRequestHandler):
                         # two copies at an offset is an echo chamber —
                         # the PC yields to the whole-house stream
                         PLAYER["mpv"] = None
+                        # kill-ok: mpv is a local audio player, not an
+                        # SDR holder
                         subprocess.run(["taskkill", "/F", "/IM",
                                         "mpv.exe"], capture_output=True)
                 else:

@@ -1,3 +1,6 @@
+# kill-ok: the docstring below DESCRIBES the anti-hard-kill law (its
+# "Stop-Process" mentions are prose, not kills) - nothing in this file
+# kills a process; it IS the graceful alternative.
 """radio_lock.py — the one-radio reservation file.
 
 Born 2026-07-19: the day lab's mystery wedges and 4%-delivery
@@ -11,13 +14,35 @@ it. Every SDR-touching process in the fleet:
      Holder context in a with-block),
   3. releases on exit, and
   4. polls should_yield() during long holds — a higher-priority waiter
-     (a Meteor pass, a human clicking LISTEN) means wrap up and let go.
+     (a Meteor pass, a human clicking LISTEN) means wrap up and let go,
+  5. polls stop_requested(owner) each work unit — the GRACEFUL STOP.
 
-Priorities (higher outranks):
-  100  satellite pass recorder (unrepeatable events)
-   80  human listening (hd_listen, the panel)
-   50  laboratory campaigns (hd_day_lab)
-   20  background rotation (the warden)
+STOP-FILE CONVENTION (added 2026-08-01, after three SDRplay API wedges
+in 24 h, every one caused by Stop-Process on a holder mid-stream —
+each cost a service restart plus a sacrificial stream probe, because
+the first stream after a wedge delivers 0 samples):
+
+    <owner>.stop in the lock directory, next to radio.lock.json
+    (i.e. stop_file(owner))
+
+  * Operator side: request_stop(owner) — or just create the empty
+    file — to ask a running holder to wind down. NEVER Stop-Process
+    a streaming holder.
+  * Holder side: check stop_requested(owner) between work units
+    (same cadence as should_yield). On seeing it: clear_stop(owner)
+    to acknowledge, close the stream, release the lock, exit 0.
+  * A fresh run calls clear_stop(owner) right after acquiring, so a
+    stale stop-file from a previous run can never kill a new one.
+    request_stop therefore only targets the run in progress.
+
+Priorities (higher outranks) — doc updated 8/01 to match fleet practice
+(labTuna's audit caught this list two tiers behind reality):
+  100  satellite pass / timed-catch recorders (unrepeatable events)
+   90  window-hold reservers (sonde_window_hold: reserve ahead of a pass)
+   80  human listening (hd_listen, the panels)
+   60  user-driven lab runs (the user asked for it now)
+   50  laboratory campaigns (hd_day_lab, hunts, baselines)
+   20  background rotation (the warden, prop_atlas, storm_watch)
 
 Stale locks (heartbeat older than TTL, or holder PID dead) are swept
 automatically — a crashed process never wedges the fleet. Nothing here
@@ -166,6 +191,35 @@ def should_yield():
     if int(w.get("priority", 0)) > int(st.get("priority", 0)):
         return f"{w['owner']} ({w.get('purpose', '?')}) outranks us"
     return None
+
+
+def stop_file(owner):
+    """Path of `owner`'s cooperative stop-file (see module docstring)."""
+    return LOCK.with_name(owner + ".stop")
+
+
+def request_stop(owner):
+    """Operator side: ask a running holder to wind down gracefully."""
+    stop_file(owner).touch()
+
+
+def stop_requested(owner):
+    """Holder side: poll this between work units, like should_yield()."""
+    try:
+        return stop_file(owner).exists()
+    except Exception:
+        return False
+
+
+def clear_stop(owner):
+    """Consume the stop-file: on acquire (stale-file guard) and as the
+    acknowledgement when a stop is honored."""
+    try:
+        stop_file(owner).unlink()
+    except FileNotFoundError:
+        pass
+    except Exception:
+        pass
 
 
 class Holder:
