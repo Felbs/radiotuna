@@ -46,14 +46,36 @@ def _read(path):
         return None
 
 
+_STILL_ACTIVE = 259          # Windows STILL_ACTIVE exit code
+
+
 def _pid_alive(pid):
+    """True only if the process is genuinely still running.
+
+    FIXED 2026-07-31: OpenProcess alone is NOT a liveness test. Windows keeps
+    the process object alive as a "zombie" while any handle to it remains, so
+    OpenProcess SUCCEEDS on a process that has already exited -- verified
+    against a PID that Get-Process reported as dead. That made this function
+    return True forever for a crashed holder, which silently disabled the
+    stale-lock sweep: a killed experiment kept the radio reserved and every
+    other job skipped its cycle waiting for a corpse to finish.
+
+    The reliable test is GetExitCodeProcess: a live process reports
+    STILL_ACTIVE (259), an exited one reports its real exit code.
+    """
     try:
         import ctypes
-        h = ctypes.windll.kernel32.OpenProcess(0x1000, False, int(pid))
-        if h:
-            ctypes.windll.kernel32.CloseHandle(h)
-            return True
-        return False
+        k = ctypes.windll.kernel32
+        h = k.OpenProcess(0x1000, False, int(pid))   # QUERY_LIMITED_INFORMATION
+        if not h:
+            return False
+        try:
+            code = ctypes.c_ulong()
+            if not k.GetExitCodeProcess(h, ctypes.byref(code)):
+                return True                  # cannot tell -> be polite
+            return code.value == _STILL_ACTIVE
+        finally:
+            k.CloseHandle(h)
     except Exception:
         return True          # can't tell -> assume alive (be polite)
 
