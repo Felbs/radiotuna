@@ -1,7 +1,7 @@
 # atlas_start.ps1 - launch the Propagation Observatory DETACHED.
 # Daemons must outlive the session that started them (Start-Process,
 # never a chat background task). Logs: lab\prop_atlas_log.txt
-$py = "C:\Users\user\radioconda\python.exe"
+$py = "$env:USERPROFILE\radioconda\python.exe"
 $repo = Split-Path -Parent $PSScriptRoot
 
 # refuse to double-start: one metronome only

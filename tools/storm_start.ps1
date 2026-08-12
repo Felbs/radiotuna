@@ -1,7 +1,7 @@
 # storm_start.ps1 - launch ionoTuna's storm watch DETACHED.
 # Daemons must outlive the session that started them (Start-Process,
 # never a chat background task). Logs: lab\storm_watch_log.txt
-$py = "C:\Users\user\radioconda\python.exe"
+$py = "$env:USERPROFILE\radioconda\python.exe"
 $repo = Split-Path -Parent $PSScriptRoot
 
 # refuse to double-start: one watcher only
