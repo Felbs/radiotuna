@@ -345,20 +345,32 @@ def open_sdr(mhz, ifgr=59.0, rfgain="3", rate=FS_CAP, ant="Antenna A"):
         # deadlocks every retry against OUR OWN lock (bit us 7/19)
         radio_lock.release("panel")
         raise
-    sdr.setSampleRate(SOAPY_SDR_RX, 0, rate)
-    sdr.setFrequency(SOAPY_SDR_RX, 0, mhz * 1e6)
-    sdr.setAntenna(SOAPY_SDR_RX, 0, ant)
     try:
-        sdr.setGainMode(SOAPY_SDR_RX, 0, False)
+        sdr.setSampleRate(SOAPY_SDR_RX, 0, rate)
+        sdr.setFrequency(SOAPY_SDR_RX, 0, mhz * 1e6)
+        sdr.setAntenna(SOAPY_SDR_RX, 0, ant)
+        try:
+            sdr.setGainMode(SOAPY_SDR_RX, 0, False)
+        except Exception:
+            pass
+        sdr.setGain(SOAPY_SDR_RX, 0, "IFGR", ifgr)
+        try:
+            sdr.writeSetting("rfgain_sel", str(rfgain))
+        except Exception:
+            pass
+        st = sdr.setupStream(SOAPY_SDR_RX, SOAPY_SDR_CS16)
+        sdr.activateStream(st)
     except Exception:
-        pass
-    sdr.setGain(SOAPY_SDR_RX, 0, "IFGR", ifgr)
-    try:
-        sdr.writeSetting("rfgain_sel", str(rfgain))
-    except Exception:
-        pass
-    st = sdr.setupStream(SOAPY_SDR_RX, SOAPY_SDR_CS16)
-    sdr.activateStream(st)
+        # setup/stream failure AFTER the lock is held: release it or every
+        # retry deadlocks against OUR OWN reservation (same law that guards
+        # the Device() constructor above, 8/20: it stopped at the ctor and
+        # left setSampleRate..activateStream leaking the p80 lock)
+        try:
+            del sdr
+        except Exception:
+            pass
+        radio_lock.release("panel")
+        raise
     # DUD-BURNER (law: the first session after a driver-service restart
     # often opens fine but streams ZEROS - the user hears static on a
     # perfectly strong station). Probe a short burst; if it's silence,
@@ -1417,14 +1429,18 @@ def hd_probe(mhz, secs=8):
     iq = LAB / "probe.cu8"   # integrity: sample-bounded loop + wall gate below
     got = 0
     t0 = time.time()
-    with open(iq, "wb") as f:
-        while got < n_want:
-            r = sdr.readStream(st, [buf], 65536, timeoutUs=500000)
-            if r.ret > 0:
-                n = min(r.ret, n_want - got)
-                f.write(cs16_to_cu8(decimate2(buf[:2 * n])).tobytes())
-                got += n
-    close_sdr(sdr, st)
+    try:
+        with open(iq, "wb") as f:
+            # wall gate INSIDE the loop (8/20): a deaf session (r.ret<=0
+            # forever) used to spin here eternally holding the p80 lock
+            while got < n_want and time.time() - t0 < secs * 1.5 + 5:
+                r = sdr.readStream(st, [buf], 65536, timeoutUs=500000)
+                if r.ret > 0:
+                    n = min(r.ret, n_want - got)
+                    f.write(cs16_to_cu8(decimate2(buf[:2 * n])).tobytes())
+                    got += n
+    finally:
+        close_sdr(sdr, st)
     # capture-integrity gate (law 7/31): a sample-bounded loop hides drops as
     # EXTRA WALL TIME - a time-warped probe fakes the HD verdict. Flag it.
     if time.time() - t0 > secs * 1.5 + 3:
