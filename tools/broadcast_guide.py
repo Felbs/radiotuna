@@ -36,6 +36,7 @@ HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
 from am_night import scan_hop as am_scan_hop, HOPS as AM_HOPS   # noqa: E402
 from hf_knob import SWBC, _ensure_sdr_dll_path                  # noqa: E402
+import radio_lock                                               # noqa: E402
 
 _ensure_sdr_dll_path()
 
@@ -166,6 +167,11 @@ def survey_fm(antenna):
     sdr, st = open_sdr(fs, antenna)
     stations = []
     for center in np.arange(88.9e6, 108.4e6, 1.6e6):
+        radio_lock.heartbeat()          # under cmd_survey's hold (TTL 90 s)
+        why = radio_lock.should_yield()
+        if why:
+            print(f"[lock] yielding FM sweep: {why}")
+            break
         sdr.setFrequency(SOAPY_SDR_RX, 0, float(center))
         time.sleep(0.12)
         iq = grab(sdr, st, 1.2, fs)
@@ -210,6 +216,11 @@ def survey_am(antenna):
     sdr, st = open_sdr(fs, antenna)
     out = {}
     for hop in AM_HOPS:
+        radio_lock.heartbeat()          # under cmd_survey's hold (TTL 90 s)
+        why = radio_lock.should_yield()
+        if why:
+            print(f"[lock] yielding AM sweep: {why}")
+            break
         sdr.setFrequency(SOAPY_SDR_RX, 0, hop)
         time.sleep(0.12)
         iq = grab(sdr, st, 2.0, fs)
@@ -227,6 +238,11 @@ def survey_sw(antenna):
     sdr, st = open_sdr(fs, antenna)
     found = []
     for name, f in SWBC:
+        radio_lock.heartbeat()          # under cmd_survey's hold (TTL 90 s)
+        why = radio_lock.should_yield()
+        if why:
+            print(f"[lock] yielding SW sweep: {why}")
+            break
         sdr.setFrequency(SOAPY_SDR_RX, 0, f)
         time.sleep(0.12)
         iq = grab(sdr, st, 2.5, fs)
@@ -267,15 +283,24 @@ def survey_sw(antenna):
 
 def cmd_survey(args):
     t0 = time.time()
-    print(f"[survey] FM band ...")
-    fm = survey_fm(args.antenna)
-    print(f"         {len(fm)} FM carriers ({sum(1 for s in fm if s['hd'])} HD)")
-    print(f"[survey] AM band ...")
-    am = survey_am(args.antenna)
-    print(f"         {len(am)} AM carriers ({sum(1 for s in am if s['iboc'])} HD)")
-    print(f"[survey] shortwave bands ...")
-    sw = survey_sw(args.antenna)
-    print(f"         {len(sw)} SW carriers")
+    # doctor 8/20: bare-open -> radio_lock (single-tenant RSPdx). One hold
+    # spans all three sweeps (~2 min > TTL 90) - the hop loops heartbeat.
+    with radio_lock.Holder("broadcast_guide", "FM+AM+SW survey", 50,
+                           wait_s=10) as hold:
+        if not hold.ok:
+            h = radio_lock.status() or {}
+            print(f"[lock] radio held by {h.get('owner', '?')} "
+                  f"({h.get('purpose', '?')}) - survey skipped")
+            return
+        print(f"[survey] FM band ...")
+        fm = survey_fm(args.antenna)
+        print(f"         {len(fm)} FM carriers ({sum(1 for s in fm if s['hd'])} HD)")
+        print(f"[survey] AM band ...")
+        am = survey_am(args.antenna)
+        print(f"         {len(am)} AM carriers ({sum(1 for s in am if s['iboc'])} HD)")
+        print(f"[survey] shortwave bands ...")
+        sw = survey_sw(args.antenna)
+        print(f"         {len(sw)} SW carriers")
     data = {"ts": datetime.now(timezone.utc).isoformat(timespec="seconds"),
             "fm": fm, "am": am, "sw": sw}
     DATA.write_text(json.dumps(data, indent=1))

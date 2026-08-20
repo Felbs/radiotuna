@@ -37,6 +37,9 @@ LAB = HERE.parent / "lab"
 LAB.mkdir(exist_ok=True)
 CURVE = LAB / "hf_curve.csv"
 
+sys.path.insert(0, str(HERE))   # sibling radio_lock, wherever we're run from
+import radio_lock
+
 FS = 250_000.0  # rate-ok: HF band-POWER survey (magnitude-only PSD bins, no
 #                 phase demod) on the same verified 250k HF path as cw.py
 
@@ -157,7 +160,18 @@ def sw_carriers(iq):
 def cmd_sweep(args, sdr_st=None):
     own = sdr_st is None
     if own:
-        sdr, st = open_sdr(args.antenna)
+        # doctor 8/20: bare-open -> radio_lock (single-tenant RSPdx)
+        if not radio_lock.acquire("hf_knob", "HF openness sweep", 50,
+                                  wait_s=10):
+            h = radio_lock.status() or {}
+            print(f"[lock] radio held by {h.get('owner', '?')} "
+                  f"({h.get('purpose', '?')}) - skipping this sweep")
+            return []
+        try:
+            sdr, st = open_sdr(args.antenna)
+        except Exception:
+            radio_lock.release("hf_knob")   # a failed open must free the lock
+            raise
     else:
         sdr, st = sdr_st
     import SoapySDR
@@ -165,20 +179,29 @@ def cmd_sweep(args, sdr_st=None):
     now = datetime.now(timezone.utc)
     rows = []
     print(f"[sweep] {now:%H:%M:%S}Z on {args.antenna}")
-    for name, f in FT8 + SWBC:
-        sdr.setFrequency(SOAPY_SDR_RX, 0, f)
-        time.sleep(0.15)
-        iq = grab(sdr, st, args.dwell)
-        if name.startswith("FT8"):
-            score, peak = ft8_activity(iq)
-        else:
-            score, peak = sw_carriers(iq)
-        rows.append((name, score, peak))
-        bar = "#" * min(40, score)
-        print(f"  {name:<8} {f/1e6:7.3f} MHz  score {score:>3}  peak +{peak:>5} dB  {bar}")
-    if own:
-        sdr.deactivateStream(st)
-        sdr.closeStream(st)
+    try:
+        for name, f in FT8 + SWBC:
+            if own:
+                radio_lock.heartbeat()   # one probe ~4 s, lock TTL 90 s
+                why = radio_lock.should_yield()
+                if why:
+                    print(f"[lock] yielding mid-sweep: {why}")
+                    break
+            sdr.setFrequency(SOAPY_SDR_RX, 0, f)
+            time.sleep(0.15)
+            iq = grab(sdr, st, args.dwell)
+            if name.startswith("FT8"):
+                score, peak = ft8_activity(iq)
+            else:
+                score, peak = sw_carriers(iq)
+            rows.append((name, score, peak))
+            bar = "#" * min(40, score)
+            print(f"  {name:<8} {f/1e6:7.3f} MHz  score {score:>3}  peak +{peak:>5} dB  {bar}")
+    finally:
+        if own:
+            sdr.deactivateStream(st)
+            sdr.closeStream(st)
+            radio_lock.release("hf_knob")
     new = not CURVE.exists()
     with open(CURVE, "a", newline="") as fo:
         w = csv.writer(fo)

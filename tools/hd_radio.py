@@ -29,6 +29,8 @@ import numpy as np
 HERE = Path(__file__).resolve().parent
 LAB = HERE.parent / "lab"          # project-root lab/, not tools/lab
 LAB.mkdir(exist_ok=True)
+sys.path.insert(0, str(HERE))   # sibling radio_lock, wherever we're run from
+import radio_lock
 import os as _os
 import shutil as _sh
 NRSC5 = (_os.environ.get("NRSC5_EXE") or _sh.which("nrsc5")
@@ -57,7 +59,7 @@ def _ensure_sdr_dll_path():
                 pass
 
 
-def open_sdr(mhz, ifgr=40.0, rfgain="3"):
+def open_sdr(mhz, ifgr=40.0, rfgain="3", purpose="listen", priority=80):
     _ensure_sdr_dll_path()
     import SoapySDR
     from SoapySDR import SOAPY_SDR_RX, SOAPY_SDR_CS16
@@ -79,21 +81,34 @@ def open_sdr(mhz, ifgr=40.0, rfgain="3"):
             pass
     ifgr = float(_os.environ.get("HD_IFGR", ifgr))
     rfgain = _os.environ.get("HD_RFGAIN", rfgain)
-    sdr = SoapySDR.Device("driver=sdrplay")
-    sdr.setSampleRate(SOAPY_SDR_RX, 0, FS_CAP)
-    sdr.setFrequency(SOAPY_SDR_RX, 0, mhz * 1e6)
-    sdr.setAntenna(SOAPY_SDR_RX, 0, ant)
+    # doctor 8/20: bare-open -> radio_lock (single-tenant RSPdx)
+    if not radio_lock.acquire("hd_radio", f"{purpose} {mhz:.1f} MHz",
+                              priority, wait_s=10.0):
+        h = radio_lock.status() or {}
+        print(f"[lock] radio held by {h.get('owner', '?')} "
+              f"({h.get('purpose', '?')}) - not opening")
+        sys.exit(1)
     try:
-        sdr.setGainMode(SOAPY_SDR_RX, 0, False)
+        sdr = SoapySDR.Device("driver=sdrplay")
+        sdr.setSampleRate(SOAPY_SDR_RX, 0, FS_CAP)
+        sdr.setFrequency(SOAPY_SDR_RX, 0, mhz * 1e6)
+        sdr.setAntenna(SOAPY_SDR_RX, 0, ant)
+        try:
+            sdr.setGainMode(SOAPY_SDR_RX, 0, False)
+        except Exception:
+            pass
+        sdr.setGain(SOAPY_SDR_RX, 0, "IFGR", ifgr)
+        try:
+            sdr.writeSetting("rfgain_sel", str(rfgain))
+        except Exception:
+            pass
+        st = sdr.setupStream(SOAPY_SDR_RX, SOAPY_SDR_CS16)
+        sdr.activateStream(st)
     except Exception:
-        pass
-    sdr.setGain(SOAPY_SDR_RX, 0, "IFGR", ifgr)
-    try:
-        sdr.writeSetting("rfgain_sel", str(rfgain))
-    except Exception:
-        pass
-    st = sdr.setupStream(SOAPY_SDR_RX, SOAPY_SDR_CS16)
-    sdr.activateStream(st)
+        # release the reservation or every retry deadlocks against OUR
+        # OWN lock (the panel's 7/19 law)
+        radio_lock.release("hd_radio")
+        raise
     return sdr, st, SOAPY_SDR_RX
 
 
@@ -119,7 +134,8 @@ def decimate2_cs16(raw):
 
 
 def cmd_capture(args):
-    sdr, st, RX = open_sdr(args.mhz, args.ifgr, args.rfgain)
+    sdr, st, RX = open_sdr(args.mhz, args.ifgr, args.rfgain,
+                           purpose="capture", priority=50)
     import SoapySDR
     n_want = int(args.secs * FS_CAP)
     buf = np.empty(2 * 65536, np.int16)
@@ -128,15 +144,22 @@ def cmd_capture(args):
     # integrity-gated below: wall time vs sample count (law 7/31)
     got = 0
     t0 = time.time()
-    with open(out, "wb") as f:
-        while got < n_want:
-            r = sdr.readStream(st, [buf], 65536, timeoutUs=500000)
-            if r.ret > 0:
-                n = min(r.ret, n_want - got)
-                f.write(cs16_to_cu8(decimate2_cs16(buf[:2 * n])).tobytes())
-                got += n
-    sdr.deactivateStream(st)
-    sdr.closeStream(st)
+    last_hb = 0.0
+    try:
+        with open(out, "wb") as f:
+            while got < n_want:
+                r = sdr.readStream(st, [buf], 65536, timeoutUs=500000)
+                if r.ret > 0:
+                    n = min(r.ret, n_want - got)
+                    f.write(cs16_to_cu8(decimate2_cs16(buf[:2 * n])).tobytes())
+                    got += n
+                if time.time() - last_hb >= 1.5:  # --secs may exceed TTL 90
+                    last_hb = time.time()
+                    radio_lock.heartbeat()
+    finally:
+        sdr.deactivateStream(st)
+        sdr.closeStream(st)
+        radio_lock.release("hd_radio")
     wall = time.time() - t0
     # capture-integrity gate (law 7/31: 90 s of WSHE held 45 s of samples and
     # faked a campaign number): a sample-bounded loop hides drops as extra
@@ -218,12 +241,22 @@ def cmd_live(args):
 
     def pump():
         buf = np.empty(2 * 65536, np.int16)
+        last_hb = 0.0
         with open(iq_path, "wb") as f:
             while not stop.is_set():
                 r = sdr.readStream(st, [buf], 65536, timeoutUs=500000)
                 if r.ret > 0:
                     f.write(cs16_to_cu8(decimate2_cs16(buf[:2 * r.ret])).tobytes())
                     f.flush()
+                now = time.time()
+                if now - last_hb >= 1.5:     # throttled: lock TTL is 90 s
+                    last_hb = now
+                    radio_lock.heartbeat()
+                    why = radio_lock.should_yield()
+                    if why:
+                        print(f"[lock] yielding: {why} - stopping live",
+                              flush=True)
+                        stop.set()
 
     threading.Thread(target=pump, daemon=True).start()
     time.sleep(3)
@@ -237,6 +270,8 @@ def cmd_live(args):
     try:
         for line in nr.stdout:
             print("  " + line.rstrip(), flush=True)
+            if stop.is_set():            # pump yielded the radio
+                break
             if not mpv_started and wav.exists() \
                     and wav.stat().st_size > 200_000:
                 subprocess.Popen([MPV, str(wav), "--volume=110",
@@ -245,10 +280,12 @@ def cmd_live(args):
                 mpv_started = True
     except KeyboardInterrupt:
         pass
-    stop.set()
-    nr.terminate()
-    sdr.deactivateStream(st)
-    sdr.closeStream(st)
+    finally:
+        stop.set()
+        nr.terminate()
+        sdr.deactivateStream(st)
+        sdr.closeStream(st)
+        radio_lock.release("hd_radio")
 
 
 def main():

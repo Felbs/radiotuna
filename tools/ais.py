@@ -35,6 +35,8 @@ except Exception:
 HERE = Path(__file__).resolve().parent
 LAB = HERE.parent / "lab"
 LAB.mkdir(exist_ok=True)
+sys.path.insert(0, str(HERE))   # sibling radio_lock, wherever we're run from
+import radio_lock
 
 FS = 250_000.0  # rate-ok: DEMOD rate only - capture happens at FS_SDR below,
 #                 decimated 125/1024 down to FS right after the grab
@@ -335,37 +337,62 @@ def cmd_capture(args):
     import SoapySDR
     from SoapySDR import SOAPY_SDR_RX, SOAPY_SDR_CS16
     SoapySDR.SoapySDR_setLogLevel(SoapySDR.SOAPY_SDR_FATAL)
-    sdr = SoapySDR.Device("driver=sdrplay")
-    sdr.setSampleRate(SOAPY_SDR_RX, 0, FS_SDR)
-    sdr.setFrequency(SOAPY_SDR_RX, 0, CENTER)
+    # doctor 8/20: bare-open -> radio_lock (single-tenant RSPdx)
+    if not radio_lock.acquire("ais", f"AIS capture {args.secs:.0f}s", 50,
+                              wait_s=10):
+        h = radio_lock.status() or {}
+        print(f"[lock] radio held by {h.get('owner', '?')} "
+              f"({h.get('purpose', '?')}) - skipping capture")
+        return
+    sdr = st = None
     try:
-        sdr.setAntenna(SOAPY_SDR_RX, 0, args.antenna)
-    except Exception:
-        pass
-    try:
-        sdr.setGainMode(SOAPY_SDR_RX, 0, False)
-        sdr.setGain(SOAPY_SDR_RX, 0, "IFGR", 22)
-        sdr.writeSetting("rfgain_sel", "0")
-    except Exception:
-        pass
-    st = sdr.setupStream(SOAPY_SDR_RX, SOAPY_SDR_CS16)
-    sdr.activateStream(st)
-    print(f"[capture] {args.secs:.0f}s @ 162.000 MHz (both AIS channels) "
-          f"on {args.antenna}")
-    n_want = int(args.secs * FS_SDR)
-    buf = np.empty(2 * 65536, np.int16)
-    out = np.empty(2 * n_want, np.int16)
-    got = 0
-    while got < n_want:
-        r = sdr.readStream(st, [buf], 65536, timeoutUs=1_000_000)
-        if r.ret > 0:
-            n = min(r.ret, n_want - got)
-            out[2 * got:2 * (got + n)] = buf[:2 * n]
-            got += n
-        elif r.ret < 0 and r.ret != -1:
-            break
-    sdr.deactivateStream(st)
-    sdr.closeStream(st)
+        sdr = SoapySDR.Device("driver=sdrplay")
+        sdr.setSampleRate(SOAPY_SDR_RX, 0, FS_SDR)
+        sdr.setFrequency(SOAPY_SDR_RX, 0, CENTER)
+        try:
+            sdr.setAntenna(SOAPY_SDR_RX, 0, args.antenna)
+        except Exception:
+            pass
+        try:
+            sdr.setGainMode(SOAPY_SDR_RX, 0, False)
+            sdr.setGain(SOAPY_SDR_RX, 0, "IFGR", 22)
+            sdr.writeSetting("rfgain_sel", "0")
+        except Exception:
+            pass
+        st = sdr.setupStream(SOAPY_SDR_RX, SOAPY_SDR_CS16)
+        sdr.activateStream(st)
+        print(f"[capture] {args.secs:.0f}s @ 162.000 MHz (both AIS channels) "
+              f"on {args.antenna}")
+        n_want = int(args.secs * FS_SDR)
+        buf = np.empty(2 * 65536, np.int16)
+        out = np.empty(2 * n_want, np.int16)
+        got = 0
+        last_hb = 0.0
+        while got < n_want:
+            r = sdr.readStream(st, [buf], 65536, timeoutUs=1_000_000)
+            if r.ret > 0:
+                n = min(r.ret, n_want - got)
+                out[2 * got:2 * (got + n)] = buf[:2 * n]
+                got += n
+            elif r.ret < 0 and r.ret != -1:
+                break
+            now = time.time()
+            if now - last_hb >= 1.5:     # --secs can exceed lock TTL 90 s
+                last_hb = now
+                radio_lock.heartbeat()
+                why = radio_lock.should_yield()
+                if why:
+                    print(f"[lock] yielding: {why} - demodulating the "
+                          f"{got / FS_SDR:.0f}s already captured")
+                    break
+    finally:
+        try:
+            if st is not None:
+                sdr.deactivateStream(st)
+                sdr.closeStream(st)
+        except Exception:
+            pass
+        radio_lock.release("ais")
     iq = ((out[0::2].astype(np.float32) + 1j * out[1::2].astype(np.float32))
           / 32768.0).astype(np.complex64)[:got]
     # decimate 2.048M -> 250k (exact 125/1024); every downstream sample-rate

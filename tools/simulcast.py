@@ -42,6 +42,7 @@ import numpy as np
 
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
+import radio_lock                  # noqa: E402 - the one-radio reservation
 LAB = HERE.parent / "lab"
 LAB.mkdir(exist_ok=True)
 LOG = LAB / "simulcast_log.txt"
@@ -132,29 +133,55 @@ def do_capture(khz_a, khz_b, secs, tag=""):
     span = abs(khz_b - khz_a) * 1e3
     fs = next(f for f in FS_LADDER if f >= span * 1.25 + 100e3)
     center = 0.5 * (khz_a + khz_b) * 1e3
-    sdr, st = _open_wide(fs, center)
-    import SoapySDR  # noqa: F401
-    time.sleep(0.5)
-    buf = np.empty(2 * 262144, np.int16)
-    for _ in range(8):
-        sdr.readStream(st, [buf], 262144, timeoutUs=1_000_000)
-    stamp = datetime.now(timezone.utc).strftime("%m%d_%H%MZ")
-    name = tag or f"{khz_a:.0f}_{khz_b:.0f}"
-    out = LAB / f"simulcast_{name}_{stamp}.cs16"
-    n_want = int(secs * fs)
-    got = 0
-    with open(out, "wb") as f:
-        while got < n_want:
-            r = sdr.readStream(st, [buf], 262144, timeoutUs=1_000_000)
-            if r.ret > 0:
-                n = min(r.ret, n_want - got)
-                buf[:2 * n].tofile(f)
-                got += n
-            elif r.ret < 0 and r.ret != -1:
-                log(f"stream err {r.ret} at {got/fs:.0f}s")
-                break
-    sdr.deactivateStream(st)
-    sdr.closeStream(st)
+    # doctor 8/20: bare-open -> radio_lock (single-tenant RSPdx)
+    if not radio_lock.acquire("simulcast",
+                              f"capture {khz_a:.0f}+{khz_b:.0f} kHz", 50,
+                              wait_s=10):
+        h = radio_lock.status() or {}
+        log(f"radio held by {h.get('owner', '?')} ({h.get('purpose', '?')})")
+        raise RuntimeError("radio busy - lock not acquired")
+    try:
+        sdr, st = _open_wide(fs, center)
+    except Exception:
+        radio_lock.release("simulcast")   # a failed open must free the lock
+        raise
+    try:
+        import SoapySDR  # noqa: F401
+        time.sleep(0.5)
+        buf = np.empty(2 * 262144, np.int16)
+        for _ in range(8):
+            sdr.readStream(st, [buf], 262144, timeoutUs=1_000_000)
+        stamp = datetime.now(timezone.utc).strftime("%m%d_%H%MZ")
+        name = tag or f"{khz_a:.0f}_{khz_b:.0f}"
+        out = LAB / f"simulcast_{name}_{stamp}.cs16"
+        n_want = int(secs * fs)
+        got = 0
+        last_hb = 0.0
+        with open(out, "wb") as f:
+            while got < n_want:
+                r = sdr.readStream(st, [buf], 262144, timeoutUs=1_000_000)
+                if r.ret > 0:
+                    n = min(r.ret, n_want - got)
+                    buf[:2 * n].tofile(f)
+                    got += n
+                elif r.ret < 0 and r.ret != -1:
+                    log(f"stream err {r.ret} at {got/fs:.0f}s")
+                    break
+                now = time.time()
+                if now - last_hb >= 1.5:  # secs default 120 > lock TTL 90
+                    last_hb = now
+                    radio_lock.heartbeat()
+                    why = radio_lock.should_yield()
+                    if why:
+                        log(f"yielding: {why} - keeping {got/fs:.0f}s")
+                        break
+    finally:
+        try:
+            sdr.deactivateStream(st)
+            sdr.closeStream(st)
+        except Exception:
+            pass
+        radio_lock.release("simulcast")
     Path(str(out) + ".json").write_text(json.dumps({
         "freq_hz": center, "fs_hz": int(fs), "format": "cs16",
         "secs": got / fs, "khz_a": khz_a, "khz_b": khz_b,
@@ -166,7 +193,11 @@ def do_capture(khz_a, khz_b, secs, tag=""):
 
 
 def cmd_capture(args):
-    do_capture(args.khz_a, args.khz_b, args.secs)
+    try:
+        do_capture(args.khz_a, args.khz_b, args.secs)
+    except RuntimeError as e:
+        log(f"capture aborted: {e}")
+        sys.exit(1)
 
 
 # ------------------------------------------------------------------- ab
@@ -304,6 +335,13 @@ def cmd_hunt(args):
     # Score each narrow pair by the WEAKER of its two carriers.
     cand = [p for p in pairs if p[3] <= 200e3][:10]
     best = None
+    # doctor 8/20: bare-open -> radio_lock (single-tenant RSPdx)
+    if cand and not radio_lock.acquire("simulcast", "pair audibility probe",
+                                       50, wait_s=10):
+        h = radio_lock.status() or {}
+        log(f"  probe skipped: radio held by {h.get('owner', '?')} "
+            f"({h.get('purpose', '?')}) - schedule order it is")
+        cand = []
     if cand:
         try:
             fs_p = 250e3
@@ -312,6 +350,11 @@ def cmd_hunt(args):
             from SoapySDR import SOAPY_SDR_RX
             buf = np.empty(2 * 65536, np.int16)
             for station, ka, kb, span in cand:
+                radio_lock.heartbeat()      # ~5 s per pair, lock TTL 90 s
+                why = radio_lock.should_yield()
+                if why:
+                    log(f"  probe yielding: {why}")
+                    break
                 sdr.setFrequency(SOAPY_SDR_RX, 0, 0.5 * (ka + kb) * 1e3)
                 time.sleep(0.25)
                 for _ in range(4):
@@ -343,6 +386,8 @@ def cmd_hunt(args):
             sdr.closeStream(st)
         except Exception as e:
             log(f"  probe failed ({str(e)[:60]}) - falling back to schedule order")
+        finally:
+            radio_lock.release("simulcast")
     if best and best[0] > 6.0:
         _, station, ka, kb, span = best
     else:
