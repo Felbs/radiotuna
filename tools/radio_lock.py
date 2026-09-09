@@ -55,8 +55,53 @@ import time
 from datetime import datetime, timezone
 from pathlib import Path
 
-LOCK = Path(r"Z:\SDR_Agent_v2\radio.lock.json")
-WANT = Path(r"Z:\SDR_Agent_v2\radio.want.json")
+
+def _lock_dir():
+    r"""The one directory every SDR-touching process must agree on.
+
+    FIXED 2026-09-08. This module hardcoded Path(r"Z:\SDR_Agent_v2\...").
+    On Windows that is the fleet share. On Linux it is not a path at all --
+    it is a RELATIVE filename whose name happens to contain backslashes, so
+    every process quietly created its own private lock in its own working
+    directory. Found two of them on radiopi2:
+
+        /home/felbs/radiotuna/tools/Z:\SDR_Agent_v2\radio.lock.json
+        /home/felbs/atsc3/Z:\SDR_Agent_v2\radio.lock.json
+
+    status() therefore always read None, acquire() always "succeeded", and
+    NOTHING arbitrated: AIS-catcher and radio_panel sat on the RSPdx while
+    atsc3 tools took a lock nobody could see and then failed to open the
+    device with "no available RSP devices found".
+
+    Order: RADIO_LOCK_DIR override, else the platform default.
+    """
+    env = os.environ.get("RADIO_LOCK_DIR")
+    if env:
+        d = Path(env)
+    elif os.name == "nt":
+        d = Path(r"Z:\SDR_Agent_v2")          # unchanged for the Windows fleet
+    else:
+        # Absolute, shared by every user on the box, and cleared at boot --
+        # a lock must never outlive the machine that held it.
+        # NB: a systemd unit with PrivateTmp=true gets its OWN /tmp and will
+        # not see this. Set RADIO_LOCK_DIR explicitly in any such unit.
+        d = Path("/tmp/sdr_agent")
+    # A relative lock path is the entire bug above. Never degrade quietly.
+    if not d.is_absolute():
+        raise RuntimeError(
+            f"radio_lock: lock dir {d!r} is not absolute -- every process "
+            f"would make its own lock in its own cwd and nothing would "
+            f"arbitrate. Set RADIO_LOCK_DIR to an absolute path.")
+    try:
+        d.mkdir(parents=True, exist_ok=True)
+    except Exception:                        # noqa: BLE001
+        pass                                 # _read/_write already tolerate it
+    return d
+
+
+_DIR = _lock_dir()
+LOCK = _DIR / "radio.lock.json"
+WANT = _DIR / "radio.want.json"
 TTL_S = 90.0
 
 
@@ -88,6 +133,21 @@ def _pid_alive(pid):
     The reliable test is GetExitCodeProcess: a live process reports
     STILL_ACTIVE (259), an exited one reports its real exit code.
     """
+    if os.name != "nt":
+        # POSIX: signal 0 tests existence without touching the process.
+        # (Without this the Windows path below raised on Linux and the
+        # except returned True forever, so a panel killed mid-watch kept
+        # the radio reserved for the whole heartbeat TTL and the next
+        # watcher started with "radio held by <a corpse>".)
+        try:
+            os.kill(int(pid), 0)
+            return True
+        except ProcessLookupError:
+            return False
+        except PermissionError:
+            return True          # someone else's process, but alive
+        except (ValueError, TypeError, OverflowError):
+            return False
     try:
         import ctypes
         k = ctypes.windll.kernel32
