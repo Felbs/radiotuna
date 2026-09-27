@@ -334,6 +334,20 @@ def cmd_selftest(args):
 # live capture
 # ==========================================================================
 def cmd_capture(args):
+    # MEMORY GUARD (2026-09-27): the whole capture is held in RAM and the
+    # demod then works in float - roughly 4x the raw int16 size. A 600 s
+    # run on an 8 GB laptop asked for ~20 GB, and systemd-oomd killed the
+    # terminal and every job in it. Refuse up front instead.
+    need = 2 * int(args.secs * FS_SDR) * 2 * 4
+    try:
+        avail = os.sysconf("SC_AVPHYS_PAGES") * os.sysconf("SC_PAGE_SIZE")
+    except (ValueError, OSError, AttributeError):
+        avail = None
+    if avail and need > 0.6 * avail:
+        max_s = int(0.6 * avail / (2 * FS_SDR * 2 * 4))
+        print(f"[capture] refusing {args.secs:.0f} s: needs ~{need / 1e9:.1f} GB, "
+              f"{avail / 1e9:.1f} GB free - use --secs {max_s} or less and repeat")
+        return 2
     import SoapySDR
     from SoapySDR import SOAPY_SDR_RX, SOAPY_SDR_CS16
     SoapySDR.SoapySDR_setLogLevel(SoapySDR.SOAPY_SDR_FATAL)
