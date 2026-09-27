@@ -46,7 +46,8 @@ python tools/radio_room.py              # http://localhost:8645 - click stations
 **Dependencies:** `numpy`, `scipy`, `numba`, and the `SoapySDR` python
 bindings + a driver for your SDR. Easiest path is
 [radioconda](https://github.com/ryanvolz/radioconda); on Debian/Ubuntu:
-`apt install python3-numpy python3-scipy python3-numba python3-soapysdr soapysdr-module-all`.
+`apt install python3-numpy python3-scipy python3-numba python3-soapysdr soapysdr-module-all`;
+on Arch/Omarchy: `pacman -S python-numpy python-scipy python-numba soapysdr soapyrtlsdr` (SDRplay: `yay -S libsdrplay soapysdrplay3-git`; HD Radio: `yay -S nrsc5-git`).
 Optional externals: [`albacore`](https://github.com/Felbs/albacore) — our
 instrumented [nrsc5](https://github.com/theori-io/nrsc5) fork and Radio
 Tuna's preferred HD Radio engine (point `ALBACORE_EXE` at it; falls back
