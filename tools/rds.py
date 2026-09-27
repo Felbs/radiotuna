@@ -218,6 +218,19 @@ def cmd_decode(args):
     raw = np.fromfile(args.file, dtype=np.int16).astype(np.float32) / 32768.0
     iq = (raw[0::2] + 1j * raw[1::2]).astype(np.complex64)
     print(f"[rds] {Path(args.file).name}: {len(iq)/args.fs:.1f}s")
+    # CHANNEL FILTER (2026-09-26): the discriminator on a wideband capture
+    # locks to the STRONGEST carrier in the span, not the one at centre - a
+    # 103.5 MHz capture returned the RDS of a station 600 kHz away. Select
+    # the wanted channel first: +-120 kHz FIR at DC (Carson width of a
+    # 75 kHz-deviation station carrying a 57 kHz subcarrier), optionally
+    # after shifting an off-centre station to DC.
+    if getattr(args, "offset_khz", 0.0):
+        n = np.arange(len(iq), dtype=np.float32)
+        iq = (iq * np.exp(2j * np.pi * (-args.offset_khz * 1e3) / args.fs * n)).astype(np.complex64)
+    if args.fs > 300e3:
+        from scipy.signal import firwin, fftconvolve
+        taps = firwin(257, 120e3, fs=args.fs).astype(np.float32)
+        iq = fftconvolve(iq, taps, mode="same").astype(np.complex64)
     d = full_decode(iq, args.fs)
     print(f"[rds] synced groups: {d['groups']}")
     if d["groups"] > 0:
@@ -239,6 +252,7 @@ def main():
     d = sub.add_parser("decode")
     d.add_argument("--file", required=True)
     d.add_argument("--fs", type=float, default=250000)
+    d.add_argument("--offset-khz", type=float, default=0.0, help="station offset from capture centre, kHz")
     args = ap.parse_args()
     if args.cmd == "selftest":
         sys.exit(cmd_selftest(args))
