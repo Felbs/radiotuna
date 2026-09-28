@@ -77,7 +77,7 @@ UP, DOWN = 3, 64             # 2.048e6 * 3/64 = 96 kHz exactly
 FS = 96000.0                 # decimated rate; tweek energy 1.5-10 kHz lives here
 SNIFF_SECS = 30.0
 STORM_SECS = 600.0
-ANTENNA = "Antenna A"        # K-180WLA loop - battery powered, bias-T OFF
+ANTENNA = os.environ.get("STORM_ANTENNA", "Antenna A")   # K-180WLA loop - battery powered, bias-T OFF; STORM_ANTENNA overrides (2026-09-27: discone on C for a probe)
 
 # ---- detection --------------------------------------------------------
 K_SIGMA = 6.0                # envelope threshold in robust sigmas

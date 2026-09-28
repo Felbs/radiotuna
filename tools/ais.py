@@ -340,7 +340,7 @@ def cmd_capture(args):
     # terminal and every job in it. Refuse up front instead.
     need = 2 * int(args.secs * FS_SDR) * 2 * 4
     try:
-        avail = os.sysconf("SC_AVPHYS_PAGES") * os.sysconf("SC_PAGE_SIZE")
+        avail = int(next((l.split()[1] for l in open("/proc/meminfo") if l.startswith("MemAvailable:")), "0")) * 1024  # MemAvailable, not MemFree: page cache is reclaimable (2026-09-28)
     except (ValueError, OSError, AttributeError):
         avail = None
     if avail and need > 0.6 * avail:
