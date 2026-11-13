@@ -232,16 +232,20 @@ def releases_after_setup_failure(name, path, entry, args=(), kwargs=None,
     clear()
 
 
+# Sibling repos sit beside this one (Z:\src\<repo> on the Windows box,
+# ~/Projects/<repo> on Linux), so find them from here, not from a drive letter.
+SIBLINGS = HERE.parent.parent
+
 # The suite. Entry points must TERMINATE (no endless monitors) except where
 # the refusal path returns early - wx_alerts is refusal-only for that reason.
 CAPTURES = [
     ("ais", str(HERE / "ais.py"), "cmd_capture",
      lambda: ns(secs=0.05, antenna="Antenna C", quiet=True)),
-    ("aprs", r"Z:\src\hamTuna\tools\aprs.py", "cmd_capture",
+    ("aprs", str(SIBLINGS / "hamTuna" / "tools" / "aprs.py"), "cmd_capture",
      lambda: ns(secs=0.05, antenna="Antenna C")),
 ]
 REFUSAL_ONLY = [
-    ("wx_alerts", r"Z:\src\wxTuna\tools\wx_alerts.py", "cmd_monitor",
+    ("wx_alerts", str(SIBLINGS / "wxTuna" / "tools" / "wx_alerts.py"), "cmd_monitor",
      lambda: ns(khz=162550, antenna="Antenna C")),
 ]
 OPENERS = [
